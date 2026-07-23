@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# The corpus is global (~/.claude-transcripts) and never lands in this repo.
+# These are only a belt-and-braces net (the corpus also self-ignores via a
+# .gitignore of '*' that the recorder writes).
+.claude-transcripts/
+corpus/
