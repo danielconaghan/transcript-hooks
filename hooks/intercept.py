@@ -846,6 +846,116 @@ def append_labels(records):
 # install / status
 # --------------------------------------------------------------------------
 
+def existing_labels():
+    """{(rule, fire_key): verdict} from labels.jsonl, last row winning — the
+    same precedence backtest.load_user_labels applies."""
+    out = {}
+    try:
+        with open(LABELS, errors="replace") as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("verdict") in ("applies", "does-not-apply"):
+                    out[(d.get("rule"), d.get("fire_key"))] = d["verdict"]
+    except Exception:
+        pass
+    return out
+
+
+def do_recent(limit=20, rule=None, session=None, todo_only=False):
+    """List recent fires with their keys, ready to label.
+
+    Needed because an `augment` fire is otherwise unlabellable in band: the
+    verdict directive is only appended to apply/ask fires, `pending` only holds
+    apply/ask, and `backtest.py --review` reads fires replayed from refined/, so
+    a live augment fire is invisible to it until its session is captured and
+    reduced. That left reading fires.jsonl by hand as the only route.
+
+    Fire keys are content hashes, so a verdict recorded here binds to the same
+    fire when the session is later replayed."""
+    try:
+        with open(FIRES, errors="replace") as fh:
+            rows = []
+            for line in fh:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        print("no fires.jsonl yet")
+        return 0
+
+    labels = existing_labels()
+    # A rule with no `fix` at all never says anything, so "did its concern
+    # apply?" is not a question — R13 fires on every message by design and
+    # would otherwise flood the todo list with unanswerable rows.
+    try:
+        import rules_engine as E
+        unjudgeable = {r["id"] for r in E.load_catalogue()["rules"]
+                       if not r.get("fix")}
+    except Exception:
+        unjudgeable = set()
+    if rule:
+        rows = [r for r in rows if r.get("rule") == rule]
+    if session:
+        rows = [r for r in rows if (r.get("session_id") or "").startswith(session)]
+    # One row per cause: the newest observation of each (rule, fire_key). A
+    # deduped repeat is the same thing to be judged, not another thing.
+    by_cause = {}
+    for r in rows:
+        by_cause[(r.get("rule"), r.get("fire_key"))] = r
+    rows = list(by_cause.values())
+    def judgeable(r):
+        return (r.get("rule") not in unjudgeable
+                and (r.get("rule"), r.get("fire_key")) not in labels)
+
+    if todo_only:
+        rows = [r for r in rows if judgeable(r)]
+    rows.sort(key=lambda r: r.get("ts") or "")
+    rows = rows[-max(1, limit):]
+
+    if not rows:
+        print("nothing to show%s" % (" (nothing left to judge)"
+                                     if todo_only else ""))
+        return 0
+
+    print("%-8s %-5s %-9s %-14s %-40s %s"
+          % ("time", "rule", "action", "verdict", "fire_key", "detail"))
+    print("-" * 108)
+    todo = []
+    for r in rows:
+        rid, key = r.get("rule"), r.get("fire_key")
+        verdict = labels.get((rid, key))
+        if not verdict and rid in unjudgeable:
+            verdict = "n/a"
+        flags = "".join(c for c, on in (
+            ("*", r.get("surfaced")), ("d", r.get("deduped")),
+            ("s", bool(r.get("suppressed")))) if on)
+        # fire_key is never truncated — it is the thing you copy.
+        print("%-8s %-5s %-9s %-14s %-40s %s"
+              % ((r.get("ts") or "")[11:19], rid,
+                 (r.get("action") or "") + (" " + flags if flags else ""),
+                 verdict or "-", key or "",
+                 " ".join((r.get("detail") or r.get("why") or "").split())[:28]))
+        if judgeable(r):
+            todo.append(r)
+
+    print("\nflags: * surfaced   d deduped   s suppressed"
+          "   |   n/a = no fix template, nothing to judge")
+    if todo:
+        r = todo[-1]
+        print("\n%d unlabelled. To record one:\n" % len(todo))
+        print('  python3 "$HOME/.claude-resync/intercept.py" --label %s \\\n'
+              '      --key %s \\\n'
+              '      --session %s \\\n'
+              '      --verdict applies|does-not-apply --note "why"'
+              % (r.get("rule"), json.dumps(r.get("fire_key") or ""),
+                 r.get("session_id") or "?"))
+    return 0
+
+
 def do_label(rule, key, verdict, note=None, session_id=None):
     """Record a verdict given in conversation. Called by the assistant, not by
     the hook — see record_verdict_directive.
@@ -1060,6 +1170,15 @@ def main(argv=None):
     ap.add_argument("--session", default=None, help="session id, with --label")
     ap.add_argument("--note", default=None,
                     help="the answer verbatim, with --label")
+    ap.add_argument("--recent", nargs="?", type=int, const=20, default=None,
+                    metavar="N",
+                    help="list the last N fires (default 20) with their keys, "
+                         "ready to label. Combine with --rule / --session / "
+                         "--todo")
+    ap.add_argument("--todo", action="store_true",
+                    help="with --recent, show only fires with no verdict yet")
+    ap.add_argument("--rule", default=None,
+                    help="with --recent, restrict to this rule id")
     args = ap.parse_args(argv)
 
     if args.install:
@@ -1068,6 +1187,8 @@ def main(argv=None):
         return do_install(remove=True)
     if args.status:
         return do_status()
+    if args.recent is not None:
+        return do_recent(args.recent, args.rule, args.session, args.todo)
     if args.label:
         return do_label(args.label, args.key, args.verdict, args.note,
                         args.session)
