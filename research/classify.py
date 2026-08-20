@@ -100,13 +100,31 @@ summary (often opening "This session is being continued from a previous
 conversation") is machine text. Return desync false, kind "none".
 
 Judge only what the message shows. Do not speculate about what might have gone
-wrong off-screen. When genuinely unsure, say so with confidence "low" rather
-than guessing either way — an uncertain label is more useful than a confident
-wrong one.
+wrong off-screen.
+
+Scoring your own certainty is part of the job, and the levels mean specific
+things. A pilot run returned "high" on every single desync it found, which is
+not credible on a task with genuinely borderline cases:
+
+  high    You can point to the exact claim or assumption in the assistant's
+          previous turn that this message contradicts. Put it in
+          `contradicts`. If you cannot fill that field, this is not high.
+  medium  It reads as a desync, but an innocent reading exists — it could be
+          read as the next instruction, or as the developer thinking aloud.
+  low     Genuinely ambiguous. You would not defend either answer.
+
+Most honest judgements are `medium`. `high` is for a contradiction you can
+quote. Spreading your answers across the three is not hedging; it is the only
+way the scores carry information.
 
 `kind` names the KIND OF DESYNC. If desync is false, kind must be "none" — do not reach for the closest-looking category. Most messages in a healthy session are not desyncs; "none" is the expected answer.
 
-`quote` must be copied verbatim from the developer's message, or be empty.\
+`quote` must be copied verbatim from the developer's message, or be empty. A
+pilot dropped a letter from a URL it called a quote; copy, do not retype.
+
+`contradicts` must be copied verbatim from the ASSISTANT'S PREVIOUS TURN — the
+claim this message shows to be wrong. Leave it empty unless confidence is
+"high", and do not claim "high" without it.\
 """
 
 SCHEMA = {
@@ -118,9 +136,15 @@ SCHEMA = {
             "scope", "undo", "none"]},
         "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
         "quote": {"type": "string"},
+        # Verbatim from the assistant's previous turn. Required to be non-empty
+        # for confidence "high", which is what stops "high" being free: the
+        # model has to produce the contradicted claim, not just assert one
+        # exists. It also hands us the assert-vs-reality pair for nothing.
+        "contradicts": {"type": "string"},
         "reason": {"type": "string"},
     },
-    "required": ["desync", "kind", "confidence", "quote", "reason"],
+    "required": ["desync", "kind", "confidence", "quote", "contradicts",
+                 "reason"],
     "additionalProperties": False,
 }
 

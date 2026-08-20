@@ -335,6 +335,40 @@ path the concern still applies. Every row records the model that produced it.
 number that rests on it. The pilot returned `confidence: high` on 13 of 13
 desyncs, which is a calibration warning rather than a strength.
 
+## Backwards walk (`research/backwalk.py`)
+
+The project works in two categories, and keeping them apart matters:
+
+- a **preventative action** happens before the assistant acts, to decrease the
+  chance of a desync. Every rule in `rules.json` is one.
+- a **retrospective marker** is where a desync *surfaced*. The divergence
+  happened earlier; by the time the message arrives the cost is paid.
+
+A marker can never be a trigger — intercepting the message that *reports* a
+failure prevents nothing. Markers are ground truth. Turning one into a
+preventative action means walking backwards: a desync landed at T, so what was
+in the pre-send state at T-n that predicted it? This does that walk.
+
+```bash
+python3 research/backwalk.py            # per-marker traces
+python3 research/backwalk.py --quiet    # totals only
+```
+
+**First result was negative, and worth knowing.** Against a base rate over all
+448 messages, no pre-send state fact predicts a marker:
+
+| state fact | before a marker | before any message | lift |
+| --- | --- | --- | --- |
+| denial | 54.8% | 72.3% | 0.76x |
+| open-question | 28.6% | 32.8% | 0.87x |
+| queue-remove | 19.0% | 31.9% | 0.60x |
+
+All below 1.0. `denial` looked like a strong candidate at 23 of 42 pre-marker
+messages until the base rate showed it present in 72% of *all* messages — it is
+background, not signal. So nothing in the current `PreSendState` supports a new
+preventative action, which is the strongest argument yet that the missing
+coverage is assistant-side rather than input-side.
+
 ## Interception (`hooks/intercept.py`)
 
 A `UserPromptSubmit` hook. Rebuilds the pre-send state, evaluates the rules,
@@ -407,6 +441,7 @@ claude-resync/
     backtest.py          replay the rules over history, measure precision
     gaps.py              find desync signals no rule responds to
     classify.py          ask a model whether each message was a real desync
+    backwalk.py          from each marker, what was visible before it
 ```
 
 The split is not cosmetic. Anything under `hooks/` runs on every prompt or tool
