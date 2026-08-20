@@ -166,14 +166,19 @@ Judge how the directive is DELIVERED, not how important it is:
              Politeness markers — "please", "can you", "could you" — do NOT
              weaken a directive. In this register they are ordinary and carry
              full force. Never mark a message weakened merely for being polite.
+             Nor does stating a WANT: "I would like X", "I need X", "I want X"
+             name the outcome required and are `direct`. Wanting a thing is not
+             being unsure of it.
   weakened   The force is reduced by how it is phrased, so a reader could take
              it as optional, as curiosity, or as an open question when it is
              not. Set EVERY form that applies — these overlap constantly and a
              message is often two or three at once:
 
-             `hedged` — the developer's certainty is presented as lower than it
-             is: "i think", "i believe", "looks like", "not sure", "i would
-             like to", "i thought", "maybe".
+             `hedged` — the developer's CERTAINTY is presented as lower than it
+             is: "i think", "i believe", "looks like", "not sure", "i thought",
+             "maybe". This is about confidence in a claim, and it is what
+             separates a hedge from a want: "I would like X" is direct, but "I
+             believe X is wrong" hedges the claim that X is wrong.
 
              `understated` — the SIGNIFICANCE is downplayed. This is about
              scale, not vocabulary, and it is the easiest one to miss. Judge the
@@ -193,6 +198,24 @@ Judge how the directive is DELIVERED, not how important it is:
              questions: "should it be taking this long?", "Are you aware that v4
              and v5 have different microservices?", "the monthly ones haven't
              run in the last month, so i think they should be run as well?"
+
+             `optative` — the OPTIONALITY is in the verb. The developer names
+             what he wants done and then offers it as something to weigh rather
+             than to do, so a reader can satisfy the message by thinking about
+             it: "consider", "have a think about", "might be worth", "it may be
+             worth looking at", "you could", "one option is", "perhaps we
+             should", "it would be nice if", "at some point".
+               "one preventative action I would like you to consider ... both
+                of these weaken a directive" — proposes an entire rule class,
+                framed as something to consider
+               "might be worth checking the seeding order" — an instruction to
+                check it
+             Distinct from `hedged`: the developer is not unsure of the CLAIM,
+             he has made the ACTION optional. "I would like you to consider X"
+             is optative even though "I would like X" would be direct — the
+             want is firm, the doing is not. Also distinct from a genuine
+             open question: an optative names the thing to be done, an open
+             question asks what should be done.
   none       Not a directive at all. Reserve this for a message that seeks
              information and asserts nothing: "where is login?", "what does
              ./do down stop?". Also an answer to something the assistant asked,
@@ -209,9 +232,13 @@ Judge how the directive is DELIVERED, not how important it is:
     important case to get right.
   * A preference stated as an observation. "it worked literally today before we
     ran the full delete" is a report that the change broke it.
+  * Something offered for consideration. "one thing worth considering is that
+    the seeding runs twice" is a directive — he named the thing and expects it
+    acted on. `weakened` / `optative`, never `none`.
 
 The distinction that matters is whether a reader could reasonably UNDER-WEIGHT
-it — treat a correction as curiosity, or an instruction as an open question.
+it — treat a correction as curiosity, an instruction as an open question, or a
+required change as an optional one.
 
 `content` is a short paraphrase of what the developer wants done or believed,
 under 15 words. Empty only when strength is "none".
@@ -229,7 +256,27 @@ Politeness and indirectness saturate this corpus: "please", "can you", "would
 you mind" are the normal register and carry FULL force. Their presence alone
 must never push you to "weakened". What makes something weakened is that the
 claim or instruction is buried, softened by uncertainty it does not really
-have, or made smaller than it is.\
+have, made smaller than it is, or made optional when it is not.
+
+Do not let the politeness rule swallow the other forms. It is narrow: it covers
+"please", "can you", "could you", "would you mind" and stating a want. It does
+NOT license reading "I would like you to consider", "I believe", "maybe" or
+"might be worth" as mere courtesy — those reduce certainty or optionality, and
+that is weakening whatever register they arrive in.
+
+ONE HARD CONSTRAINT, and it is not optional. `hedged`, `understated`,
+`interrogative` and `optative` are not independent annotations. They are the
+four ways a directive can be WEAKENED, so:
+
+  * If any of the four is true, `strength` MUST be "weakened".
+  * If `strength` is "direct" or "none", all four MUST be false.
+
+Setting a flag while choosing "direct" or "none" is self-contradictory and the
+row is discarded. So if you are about to do it, your `strength` is what is
+wrong: go back and set it to "weakened". The one exception to watch is a plain
+information-seeking question — "where is login?" is grammatically a question but
+asserts nothing, so it is `none` with `interrogative` FALSE. The flag marks a
+directive wearing a question, not any question.\
 """
 
 DIRECTIVE_SCHEMA = {
@@ -246,12 +293,22 @@ DIRECTIVE_SCHEMA = {
         "hedged": {"type": "boolean"},
         "understated": {"type": "boolean"},
         "interrogative": {"type": "boolean"},
+        # Added after a demonstrated false negative: "one preventative action I
+        # would like you to consider ..." came back direct/high, and the reason
+        # field named "I would like" as a politeness marker carrying full force
+        # — the politeness rule had absorbed the hedge list, which contained
+        # "i would like to". The verb, not the courtesy, is what makes this
+        # weak, and the taxonomy had no name for it. Opus read the same message
+        # as weakened/hedged under the old prompt, so the flag exists to give
+        # the smaller model a category rather than to teach the larger one.
+        "optative": {"type": "boolean"},
         "content": {"type": "string"},
         "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
         "reason": {"type": "string"},
     },
     "required": ["is_directive", "strength", "hedged", "understated",
-                 "interrogative", "content", "confidence", "reason"],
+                 "interrogative", "optative", "content", "confidence",
+                 "reason"],
     "additionalProperties": False,
 }
 
@@ -460,11 +517,12 @@ def main(argv=None):
         for st, c in d.most_common():
             print("%-10s %d" % (st, c))
         print("\nforms (independent, so they overlap):")
-        for f in ("hedged", "understated", "interrogative"):
+        for f in ("hedged", "understated", "interrogative", "optative"):
             n = sum(1 for r in rows if r.get(f))
             print("   %-14s %d" % (f, n))
         combos = collections.Counter(
-            tuple(f for f in ("hedged", "understated", "interrogative")
+            tuple(f for f in ("hedged", "understated", "interrogative",
+                                  "optative")
                   if r.get(f)) for r in rows if r["strength"] == "weakened")
         print("\ncombinations among weakened:")
         for c, n in combos.most_common():

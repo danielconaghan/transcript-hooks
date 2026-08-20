@@ -119,7 +119,8 @@ def measure(lookahead, want_examples=False):
                 # Three independent flags, so a message counts under each form
                 # it carries. `weakening` was a single enum until hedge was
                 # found to be absorbing every understated message.
-                forms = [f for f in ("hedged", "understated", "interrogative")
+                forms = [f for f in ("hedged", "understated", "interrogative",
+                                      "optative")
                          if d.get(f)]
                 for wf in (forms or ["(unflagged)"]):
                     form_tot[wf] += 1
