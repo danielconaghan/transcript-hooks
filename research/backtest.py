@@ -55,7 +55,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -304,6 +304,94 @@ def label(rule, fire, msg, session, user_labels):
     return None, "no labelling strategy"
 
 
+def append_labels(rows):
+    """Append to the same file, in the same shape, the live interceptor writes.
+    One loader reads both, so a hand verdict and a reply-parsed verdict are
+    worth exactly the same to every figure downstream."""
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(LABELS), mode=0o700, exist_ok=True)
+    with open(LABELS, "a", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+    os.chmod(LABELS, 0o600)
+
+
+def review(fixture, user_labels, rule=None, limit=None):
+    """Hand-label fires at the terminal, one at a time.
+
+    This is the other half of the feedback loop, and the half the interceptor
+    structurally cannot provide. A hook can only collect a verdict on a fire it
+    actually surfaced, which leaves two blind spots:
+
+      * every `augment` rule never asks anything, so it is never judged. R08
+        has 59 historical fires and a precision of `null`, permanently.
+      * the precision floor is a ONE-WAY DOOR without this. A demoted rule
+        never surfaces, so it never earns a verdict, so it stays demoted on
+        the very figure that demoted it. R06 at 3.8% can only get out of jail
+        by someone reading its fires.
+
+    Replay is what makes this possible: the historical fires already exist, so
+    the judgement can happen offline, in bulk, away from the critical path of
+    any message. Unlike the live loop, this can afford to ask properly."""
+    todo = []
+    for sid, sess in fixture.items():
+        for fire, msg in sess["fires"]:
+            if rule and fire.rule != rule:
+                continue
+            if (fire.rule, fire.key) in user_labels:
+                continue
+            todo.append((sid, fire, msg))
+    todo.sort(key=lambda t: (t[1].rule, t[0]))
+    if limit:
+        todo = todo[:limit]
+    if not todo:
+        print("nothing unlabelled to review%s."
+              % (" for %s" % rule if rule else ""))
+        return 0
+
+    print("%d unlabelled fire(s). For each: reading that message, was the "
+          "rule's concern real?" % len(todo))
+    print("  [a] applies   [d] does not apply   [s] skip   [q] quit\n")
+    rows = 0
+    pending = []
+    for sid, fire, msg in todo:
+        text = re.sub(r"\s+", " ", msg.get("text") or "")
+        print("-" * 74)
+        print("%s  %s  session %s" % (fire.rule, fire.key, sid[:8]))
+        print("  why    : %s" % fire.why)
+        if fire.detail:
+            print("  detail : %s" % fire.detail[:200])
+        print("  message: %s" % text[:400])
+        try:
+            ans = input("  verdict [a/d/s/q]: ").strip().lower()[:1]
+        except (EOFError, KeyboardInterrupt):
+            print("\nstopped.")
+            break
+        if ans == "q":
+            break
+        if ans not in ("a", "d"):
+            continue
+        pending.append({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "session_id": sid, "rule": fire.rule, "fire_key": fire.key,
+            "verdict": "applies" if ans == "a" else "does-not-apply",
+            "note": text[:200], "source": "manual-review",
+        })
+        rows += 1
+        # Flush as we go: an interrupted review keeps the verdicts already
+        # given rather than throwing away twenty minutes of reading.
+        if len(pending) >= 5:
+            append_labels(pending)
+            pending = []
+    append_labels(pending)
+    print("\nrecorded %d verdict(s) -> %s" % (rows, LABELS))
+    if rows:
+        print("re-run without --review to see the effect; add --write to fold "
+              "it into rules.json, which is what promotes a rule off the floor.")
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--write", action="store_true",
@@ -311,6 +399,12 @@ def main(argv=None):
     ap.add_argument("--rule", default=None, help="only this rule id")
     ap.add_argument("--list-fires", action="store_true",
                     help="print individual fires")
+    ap.add_argument("--review", action="store_true",
+                    help="hand-label unjudged fires, interactively. The only "
+                         "feedback path for augment rules and for any rule "
+                         "held below the precision floor")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="with --review, stop after N fires")
     args = ap.parse_args(argv)
 
     fixture = load_fixture()
@@ -322,6 +416,9 @@ def main(argv=None):
         print("your labels: %d verdict(s) from labels.jsonl" % len(user_labels))
     print()
 
+    if args.review:
+        return review(fixture, user_labels, rule=args.rule, limit=args.limit)
+
     by_rule = collections.defaultdict(list)
     for sid, sess in fixture.items():
         for fire, msg in sess["fires"]:
@@ -330,37 +427,47 @@ def main(argv=None):
 
     results = {}
     wanted = [args.rule] if args.rule else sorted(E.RULES)
-    print("%-5s %-13s %6s %6s %6s %6s %8s %9s"
+    print("%-5s %-13s %6s %6s %6s %6s %8s %9s %6s"
           % ("rule", "basis", "fires", "conf", "refut", "unkn", "floor",
-             "labelled"))
-    print("-" * 74)
+             "labelled", "yours"))
+    print("-" * 81)
     for rid in wanted:
         rows = by_rule.get(rid, [])
         basis = BASIS.get(rid, "none")
         if not rows:
             results[rid] = {"fires": 0, "basis": basis, "confirmed": 0,
                             "refuted": 0, "unknown": 0, "sessions": 0,
+                            "hand_labelled": 0,
                             "precision": None, "precision_labelled": None}
-            print("%-5s %-13s %6d %6s %6s %6s %8s %9s"
-                  % (rid, basis, 0, "-", "-", "-", "-", "-"))
+            print("%-5s %-13s %6d %6s %6s %6s %8s %9s %6s"
+                  % (rid, basis, 0, "-", "-", "-", "-", "-", "-"))
             continue
         tp = sum(1 for r in rows if r[3] is True)
         fp = sum(1 for r in rows if r[3] is False)
         un = sum(1 for r in rows if r[3] is None)
+        yours = sum(1 for r in rows
+                    if (rid, r[1].key) in user_labels)
         floor = (tp / len(rows)) if rows else None
         lab = (tp / (tp + fp)) if (tp + fp) else None
-        if basis in ("tautological", "manual", "none"):
+        # A basis of tautological/manual/none means no *heuristic* can label
+        # this rule, so its precision is undefined — but a hand verdict is not
+        # a heuristic. Nulling it regardless is what made `--review` pointless
+        # for the six rules that need it most: the label was applied per fire
+        # and then thrown away in the aggregate.
+        if basis in ("tautological", "manual", "none") and not yours:
             floor = lab = None
         results[rid] = {
             "fires": len(rows), "confirmed": tp, "refuted": fp, "unknown": un,
             "basis": basis, "sessions": len(set(r[0] for r in rows)),
+            "hand_labelled": yours,
             "precision": round(floor, 3) if floor is not None else None,
             "precision_labelled": round(lab, 3) if lab is not None else None,
         }
-        print("%-5s %-13s %6d %6d %6d %6d %8s %9s"
+        print("%-5s %-13s %6d %6d %6d %6d %8s %9s %6s"
               % (rid, basis, len(rows), tp, fp, un,
                  ("%.0f%%" % (floor * 100)) if floor is not None else "n/a",
-                 ("%.0f%%" % (lab * 100)) if lab is not None else "n/a"))
+                 ("%.0f%%" % (lab * 100)) if lab is not None else "n/a",
+                 yours or "-"))
         if args.list_fires or args.rule:
             for sid, fire, msg, l, why in rows[:25]:
                 mark = {True: "TP", False: "FP", None: "??"}[l]

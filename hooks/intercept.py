@@ -496,6 +496,10 @@ def resolve_pending(cache, prompt, session_id):
             "verdict": verdict, "note": note,
             "asked_at": p.get("at"), "asked_prompt_id": p.get("prompt_id"),
             "action": p.get("action"), "phase": phase(),
+            # Distinguishes a verdict inferred from your next reply from one
+            # you gave deliberately in `backtest.py --review`. Same weight
+            # downstream, but only one of them is something you chose to say.
+            "source": "verdict-reply",
         })
     return rows
 

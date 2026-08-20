@@ -66,6 +66,28 @@ spec as implemented; where the build departed from the original plan, it says so
 the suppression counts and the verdict tally. `--verdict "some reply"` shows how
 a reply would parse.
 
+### The forward loop is not enough on its own
+
+`python3 research/backtest.py --review [--rule R06] [--limit N]` hand-labels
+fires at the terminal and writes to the same `labels.jsonl`, tagged
+`source: "manual-review"` against the interceptor's `source: "verdict-reply"`.
+
+It exists because the hook can only judge a fire it actually *surfaced*, which
+leaves two blind spots the forward loop cannot reach by construction:
+
+- **`augment` rules never ask anything, so they are never judged.** R08 has 59
+  fires and a `null` precision, permanently. R05 sits at 3% and injects into
+  every message that names an endpoint, silently, unmeasured.
+- **The precision floor is a one-way door without it.** A demoted rule never
+  surfaces, so it never earns a verdict, so it stays demoted on the very figure
+  that demoted it. Hand review of the historical fires is the only way R06 gets
+  out of jail.
+
+Reviewing replayed fires is cheap in a way the live ask is not: the fires
+already exist, so the judging happens offline and in bulk, nowhere near the
+critical path of a message. Verdicts are flushed every 5 rows, so an
+interrupted review keeps what you already gave it.
+
 ### Not built: API-drafted fixes
 
 Only R09 carries `{"via": "api"}`, and R09 returns no fires by design, so the
@@ -273,6 +295,16 @@ asks too often "will be disabled within a day", and R06 at 3.8% precision was
 about to become a question on every message naming a path. Unmeasured (`None`)
 is not floored — that rule needs to ask to become measured.
 
+**A hand verdict is not a heuristic.** `basis` records which *automatic*
+labelling strategy applies to a rule, so `tautological`/`manual`/`none` mean no
+heuristic can judge it. The report used to null those rules' precision
+unconditionally, which silently discarded hand labels for the six rules that
+can only ever be labelled by hand — the verdict was applied per fire and then
+thrown away in the aggregate. Basis now nulls precision only when there are no
+hand labels. Rules with `basis: manual` were always meant to be judged this
+way; `rules.json`'s own `caveat_precision` says "no figure here comes from
+hand-labelling yet", and that "yet" needed a tool.
+
 **`rules.json` is canonical in the repo**, deployed by `install.py`, updated by
 `backtest.py --write`. `install.py status` reports drift so a stale catalogue is
 visible rather than silently in force.
@@ -302,6 +334,10 @@ untouched. A hook that can break a session is worse than no hook.
   interrupting rule in the catalogue and it currently reaches nobody. Narrowing
   the trigger is worth more than any new rule: the fires are real references,
   the check ("does it resolve") is just too weak to be worth a question.
+  Start with `backtest.py --review --rule R06` — 53 fires is an afternoon, and
+  it is the only thing that can either raise the figure or prove it deserved.
+  (Checked: only 2 of the 53 fire on a compaction summary rather than a typed
+  message, so contaminated input is not the explanation. The check is.)
 - **No rule addresses the assistant asserting a state its own tool output
   contradicts** — observed twice: *"still running, log ticking"* against a
   3.5-minute-stale log, and *"17 tests, all green"* against a dev server it had
