@@ -88,12 +88,63 @@ already exist, so the judging happens offline and in bulk, nowhere near the
 critical path of a message. Verdicts are flushed every 5 rows, so an
 interrupted review keeps what you already gave it.
 
-### Not built: API-drafted fixes
+### How a verdict is recorded
 
-Only R09 carries `{"via": "api"}`, and R09 returns no fires by design, so the
-API path would have been unreachable code guarding the one place anything
-leaves this machine. A fire whose template renders nothing is recorded as
-`suppressed: "no-template"` and never marked as asked. Build this when a rule
+Two paths write `labels.jsonl`, and every row carries a `source` so any figure
+can be recomputed without whichever path you distrust:
+
+| source | written by | when |
+| --- | --- | --- |
+| `assistant-classified` | `intercept.py --label` run by the assistant | the primary path — the assistant reads your natural answer and records it |
+| `verdict-reply` | the hook's leading-yes/no parse | fallback, only if the assistant did not record one |
+| `manual-review` | `backtest.py --review` | offline, in bulk |
+
+The assistant-classified path exists because the regex path barely works.
+Measured over all 441 historical messages, `parse_verdict` labels **5.2%** of
+them and inverts some of those — *"nope you are correct its dev-adviser"* parses
+as `does-not-apply` while semantically confirming. Reading an answer is the one
+part of this loop a model does better than a regex, so the injected directive
+asks the assistant to record it via a shell command. That lands in the
+transcript as a structured `tool_use`, which phase 4 can detect by shape rather
+than by grepping text — the trap that caught the probe.
+
+`--label` clears the fire from the session's `pending` list, so the regex
+fallback cannot write a second, dumber label for the same fire.
+
+This does put a model in the labelling path. `PLAN.md` forbids that in the
+*trigger* path, for reproducibility; the label path is a different question, and
+survivable only because the provenance stays separable and the note keeps your
+words verbatim for audit.
+
+### API-drafted fixes
+
+Built. A rule whose `fix` is `{"via": "api", "instruction": ..., "fallback":
+...}` has its injection drafted at fire time; `fallback` is a plain template
+used whenever the call is off, uncredentialled, slow, rate-limited or refused.
+**Enabling the API can improve an injection but can never remove one.**
+
+- `claude-opus-5`, `effort: "low"`, `max_tokens` 400, **5s** timeout,
+  `max_retries=0` — the SDK retries timeouts, so retries would multiply
+  wall-clock against the hook ceiling. Low effort is the latency lever;
+  disabling thinking on Opus 5 risks a tool call landing in visible text.
+- Sends the outgoing message, the rule's concern, the reference list and cwd.
+  **Not the transcript.**
+- Drafts are cached per `(rule, fire_key)` in the session cache, so the same
+  references do not re-pay the latency every turn. A `SKIP` reply is cached as
+  silence rather than falling back to the generic template.
+- `CLAUDE_RESYNC_API=0` stops every outbound call without touching the
+  catalogue. Credentials come from `~/.claude-resync/.env` (0600) because a hook
+  does not inherit your shell's exports; a real exported variable still wins.
+- Requires `pip install anthropic`. Without it the status line says so and every
+  R06 fire quietly uses the template.
+
+**R06 was moved from `ask` to `augment` to make this reachable at all.** At 3.8%
+precision the floor held it at log-only, so an API-drafted fix would have been
+drafted for nobody. As an `augment` the floor does not apply, and low precision
+costs context rather than attention — which is the right trade for a rule whose
+fires are real references and whose *check* is the weak part. The consequence to
+watch: R06 fires on ~12% of messages with no dedupe, so expect up to 5s of added
+latency the first time a message cites a new set of paths. Build this when a rule
 that actually fires needs it.
 
 ### The shape, decided
@@ -136,10 +187,10 @@ measured — check with `--status`, not from this table:
 
 | runtime action | rules | behaviour |
 | --- | --- | --- |
-| `augment` | R02 R03 R05 R08 R12 R13 | silent, every turn, no dedupe |
+| `augment` | R02 R03 R05 **R06** R08 R12 R13 | silent, every turn, no dedupe |
 | `apply` | R01 R04 | injects its fix, asks nothing; the label comes from whether you object |
 | `ask` | R07 R09 R10 R11 | injects a directive, verdict recorded |
-| `log` | R06 | fires and is recorded, never surfaced |
+| `log` | *(none currently)* | fires and is recorded, never surfaced |
 
 R09 still returns no fires by design: its trigger needs claim extraction, not a
 regex, and a guessed regex would put unmeasurable fires into the label stream

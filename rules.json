@@ -327,7 +327,7 @@
         "against": "the filesystem and the repo contents",
         "method": "resolve the reference; grep it for the thing it is cited for; name a repo that does contain it"
       },
-      "action": "ask",
+      "action": "augment",
       "prompt_to_user": "You cite X for Y, but X does not contain Y. Z does. Use Z?",
       "rationale": "A brief that makes named repos authoritative and names the wrong ones is the most expensive kind of wrong, because the assistant is instructed to defer to them. Two of three named references were the wrong ones in a0c27fd2; the correct repo was supplied 18 minutes in and promoted to 'the new basis' 7 minutes after that.",
       "metrics": {
@@ -369,7 +369,11 @@
       ],
       "confidence": "medium",
       "notes": "Split by outcome: unresolvable reference -> ask; resolvable but lacking the cited pattern -> augment with the repo that has it. Only the first deserves an interruption.",
-      "fix": "The message cites reference(s): {detail}. {why}. Confirm the reference actually contains the pattern it is cited for before following it."
+      "fix": {
+        "via": "api",
+        "instruction": "You are drafting one short note to prepend to a developer's message, for the assistant that is about to act on it. The message cites file paths or repositories. State plainly what is actually true about those references — whether they exist, and whether they plausibly contain what the message claims. Be specific and under 60 words. If nothing useful can be said, reply with exactly: SKIP",
+        "fallback": "The message cites reference(s): {detail}. {why}. Confirm the reference actually contains the pattern it is cited for before following it."
+      }
     },
     {
       "id": "R07",

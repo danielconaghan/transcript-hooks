@@ -135,6 +135,9 @@ DATA_DIR = os.path.join(HOME_DIR, "data")
 FIRES = os.path.join(DATA_DIR, "fires.jsonl")
 LABELS = os.path.join(DATA_DIR, "labels.jsonl")
 ERRLOG = os.path.join(DATA_DIR, "intercept-errors.log")
+# Credentials for the API-drafted fixes. Outside the repo, 0600. A hook does
+# not see your shell's exports, so this file is how a key reaches it.
+ENVFILE = os.path.join(HOME_DIR, ".env")
 
 # Substring identifying our hook command, for idempotent install/uninstall.
 SENTINEL = "intercept.py"
@@ -261,6 +264,7 @@ class SessionCache(object):
         self.seen = {}        # fire_key -> iso ts first surfaced
         self.pending = []     # fires awaiting a verdict from the next message
         self.asks = 0         # interrupting fires surfaced this session
+        self.drafted = {}     # "rule|key" -> API-drafted text, to avoid re-paying
         self.reset_transcript_state()
 
     def reset_transcript_state(self):
@@ -290,6 +294,8 @@ class SessionCache(object):
                 self.asks = int(d.get("asks") or 0)
             except Exception:
                 self.asks = 0
+            drafted = d.get("drafted")
+            self.drafted = drafted if isinstance(drafted, dict) else {}
         except Exception:
             self.__init__(self.session_id)   # absent, corrupt, or stale shape
 
@@ -302,7 +308,7 @@ class SessionCache(object):
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump({"offset": self.offset, "acc": acc,
                            "seen": self.seen, "pending": self.pending,
-                           "asks": self.asks}, fh,
+                           "asks": self.asks, "drafted": self.drafted}, fh,
                           ensure_ascii=False, default=str)
             os.chmod(tmp, 0o600)
             os.replace(tmp, self.path)
@@ -451,23 +457,173 @@ class Resolver(object):
 # fix rendering
 # --------------------------------------------------------------------------
 
-def render_fix(fire, rule_cfg, state):
-    """Text to inject for one fire.
+TERMINAL_ROLES = ("", "0", "no", "off", "false")
+
+# The one place anything in this project leaves the machine. Sends the outgoing
+# message, the rule's concern and the reference list — never the transcript.
+# claude-opus-5 with effort "low": low effort is the latency lever, not
+# disabling thinking, which on Opus 5 can put a tool call into visible text.
+API_MODEL = "claude-opus-5"
+API_TIMEOUT_S = 5.0          # hook ceiling is 30s, but this is added latency
+                             # on a message you are waiting to send
+API_MAX_TOKENS = 400
+
+
+def api_enabled():
+    """Set CLAUDE_RESYNC_API=0 to stop every outbound call without touching
+    the catalogue."""
+    return (os.environ.get("CLAUDE_RESYNC_API", "1").strip().lower()
+            not in TERMINAL_ROLES)
+
+
+def load_env_file(path=None):
+    """Read ~/.claude-resync/.env into the environment.
+
+    A hook does not inherit your interactive shell, so an `export` in .zshrc is
+    not visible here — a file beside the runtime is. Existing environment
+    variables always win, so a real export still overrides the file.
+
+    Returns the number of variables set. Never raises: a missing or malformed
+    .env must degrade to "no credentials", not to a broken hook."""
+    path = path or ENVFILE
+    n = 0
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                if key.startswith("export "):
+                    key = key[7:].strip()
+                val = val.strip().strip("'").strip('"')
+                if key and val and key not in os.environ:
+                    os.environ[key] = val
+                    n += 1
+    except Exception:
+        pass
+    return n
+
+
+def draft_via_api(spec, fire, state):
+    """Ask a model to draft one injection. Returns (text, status).
+
+    Never raises and never retries: `max_retries=0` because the SDK retries
+    timeouts, so wall-clock would be timeout x (retries+1) against a 30s hook
+    ceiling. Every failure path returns None so the caller falls back to the
+    rule's static template — a rule that says something slightly generic beats
+    a rule that says nothing because a socket hung."""
+    if not api_enabled():
+        return None, "off"
+    instruction = (spec or {}).get("instruction")
+    if not instruction:
+        return None, "no-instruction"
+    try:
+        import anthropic
+    except Exception:
+        return None, "sdk-missing"
+    load_env_file()
+    situation = (
+        "Outgoing message:\n%s\n\nRule concern: %s\nReferences: %s\n"
+        "Working directory: %s"
+        % (state.prompt[:2000], fire.why or "", fire.detail or "",
+           state.cwd or "?"))
+    try:
+        client = anthropic.Anthropic()
+        resp = client.with_options(
+            timeout=API_TIMEOUT_S, max_retries=0).messages.create(
+                model=API_MODEL,
+                max_tokens=API_MAX_TOKENS,
+                output_config={"effort": "low"},
+                system=instruction,
+                messages=[{"role": "user", "content": situation}])
+        if resp.stop_reason == "refusal":
+            return None, "refusal"
+        text = " ".join(b.text for b in resp.content
+                        if getattr(b, "type", None) == "text").strip()
+        if not text:
+            return None, "empty"
+        if text.strip().rstrip(".").upper() == "SKIP":
+            # The instruction offers SKIP for "nothing useful to say". Honour it
+            # as silence, not as a reason to fall back to the generic template —
+            # falling back would reintroduce exactly the noise SKIP avoids.
+            return None, "skip"
+        return text, "drafted"
+    except anthropic.APITimeoutError:
+        return None, "timeout"
+    except anthropic.AuthenticationError:
+        return None, "no-credentials"
+    except anthropic.RateLimitError:
+        return None, "rate-limited"
+    except anthropic.APIStatusError as exc:
+        log_error("api status %s" % getattr(exc, "status_code", "?"))
+        return None, "api-error"
+    except anthropic.APIConnectionError:
+        return None, "offline"
+    except Exception as exc:
+        log_error("api call failed: %r" % (exc,))
+        return None, "error"
+
+
+def render_fix(fire, rule_cfg, state, cache=None):
+    """Text to inject for one fire. Returns (text, api_status).
 
     Templates come from the rule's `fix` field in rules.json, so the catalogue
     stays the single record of what each rule does. A rule with no template
     injects nothing — it is logged and counted, but silence beats inventing
-    advice the catalogue never sanctioned."""
-    tmpl = (rule_cfg or {}).get("fix")
-    if not tmpl:
-        return None
-    if isinstance(tmpl, dict):
-        return None              # {"via": "api"} — phase 3
+    advice the catalogue never sanctioned.
+
+    A dict `fix` means the wording needs reading the situation rather than
+    restating it: `{"via": "api", "instruction": ..., "fallback": ...}`. The
+    fallback is a plain template and is used whenever the call is off,
+    unavailable, slow or refused — so enabling the API can improve an
+    injection but can never remove one."""
+    spec = (rule_cfg or {}).get("fix")
+    if not spec:
+        return None, None
+    status = None
+    if isinstance(spec, dict):
+        key = "%s|%s" % (fire.rule, fire.key)
+        if cache is not None and key in cache.drafted:
+            return cache.drafted[key], "cached"
+        text, status = draft_via_api(spec, fire, state)
+        if text:
+            if cache is not None:
+                # Same references in the same session draft to the same advice.
+                # Re-paying the latency and the call every turn would be silly.
+                cache.drafted[key] = text
+            return text, status
+        if status == "skip":
+            if cache is not None:
+                cache.drafted[key] = ""   # remember the silence too
+            return None, status
+        spec = spec.get("fallback")
+        if not spec:
+            return None, status
     try:
-        return tmpl.format(detail=fire.detail or "", why=fire.why or "",
-                           cwd=state.cwd or "")
+        return spec.format(detail=fire.detail or "", why=fire.why or "",
+                           cwd=state.cwd or ""), status
     except Exception:
-        return tmpl
+        return spec, status
+
+
+def record_verdict_directive(fire, session_id):
+    """Appended to an interrupting rule's injection so the verdict can be
+    recorded from natural language rather than guessed from a regex.
+
+    Measured over 441 historical messages, a leading-yes/no parse labels 5.2%
+    of replies and inverts some of those ("nope you are correct..."). Reading
+    the answer is the one part of this loop a model does better than a regex,
+    so the model is asked to record it — as a shell command, which lands in the
+    transcript as a structured tool_use rather than as text to be grepped."""
+    return (
+        "When Daniel answers, record the verdict so this rule can be scored: "
+        "python3 \"$HOME/.claude-resync/intercept.py\" --label %s "
+        "--key %s --session %s --verdict applies|does-not-apply "
+        "--note \"<his answer, verbatim>\". Record does-not-apply if the "
+        "concern turned out not to hold. Do not record a verdict he did not "
+        "give." % (fire.rule, json.dumps(fire.key), session_id))
 
 
 # --------------------------------------------------------------------------
@@ -539,12 +695,12 @@ def run_hook(payload, dry_run=False):
         injections, records = [], []
         for f in fires:
             action = E.action_for(f.rule, catalogue)
-            surfaced, deduped, suppressed = False, False, None
+            surfaced, deduped, suppressed, api = False, False, None, None
 
             if action == "augment":
                 # Silent, and re-stated every turn: that is what keeps the
                 # facts current. No dedupe, by design.
-                text = render_fix(f, by_id.get(f.rule), state)
+                text, api = render_fix(f, by_id.get(f.rule), state, cache)
                 if text:
                     injections.append(text)
                     surfaced = True
@@ -565,14 +721,15 @@ def run_hook(payload, dry_run=False):
                     suppressed = "ask-budget"
                     cache.seen[f.key] = _iso(_now())
                 else:
-                    text = render_fix(f, by_id.get(f.rule), state)
+                    text, api = render_fix(f, by_id.get(f.rule), state, cache)
                     if not text:
-                        # {"via": "api"} or no template. Nothing to say, so
-                        # say nothing — but do not mark it asked.
+                        # No template and no draft. Nothing to say, so say
+                        # nothing — but do not mark it asked.
                         suppressed = "no-template"
                         cache.seen[f.key] = _iso(_now())
                     else:
-                        injections.append(text)
+                        injections.append(
+                            text + "\n" + record_verdict_directive(f, session_id))
                         surfaced = True
                         cache.seen[f.key] = _iso(_now())
                         cache.asks += 1
@@ -592,6 +749,8 @@ def run_hook(payload, dry_run=False):
                 rec["deduped"] = True
             if suppressed:
                 rec["suppressed"] = suppressed
+            if api:
+                rec["api"] = api
             if surfaced and action != "augment":
                 rec["pending_verdict"] = True
             records.append(rec)
@@ -653,6 +812,43 @@ def append_labels(records):
 # --------------------------------------------------------------------------
 # install / status
 # --------------------------------------------------------------------------
+
+def do_label(rule, key, verdict, note=None, session_id=None):
+    """Record a verdict given in conversation. Called by the assistant, not by
+    the hook — see record_verdict_directive.
+
+    Also clears the key from the session's pending list, so the hook's
+    leading-yes/no fallback does not write a second, dumber label for the same
+    fire on the next message."""
+    import rules_engine as E
+    if verdict not in ("applies", "does-not-apply"):
+        print("verdict must be 'applies' or 'does-not-apply'")
+        return 2
+    if rule not in E.RULES:
+        print("unknown rule %r" % rule)
+        return 2
+    if not key:
+        print("--key is required (the fire_key from the injected directive)")
+        return 2
+    append_labels([{
+        "ts": _iso(_now()), "session_id": session_id, "rule": rule,
+        "fire_key": key, "verdict": verdict,
+        "note": re.sub(r"\s+", " ", note or "")[:400],
+        "source": "assistant-classified", "phase": phase(),
+    }])
+    cleared = False
+    if session_id:
+        cache = SessionCache(session_id)
+        cache.load()
+        before = len(cache.pending)
+        cache.pending = [p for p in cache.pending if p.get("fire_key") != key]
+        if len(cache.pending) != before:
+            cache.save()
+            cleared = True
+    print("recorded %s %s -> %s%s" % (rule, key, verdict,
+                                      " (cleared pending)" if cleared else ""))
+    return 0
+
 
 def settings_path():
     return os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
@@ -746,6 +942,27 @@ def do_status():
     print("  budget   : max %d interrupting fire(s) per session, once per cause"
           % MAX_ASKS_PER_SESSION)
 
+    api_rules = [r["id"] for r in cat["rules"]
+                 if isinstance(r.get("fix"), dict)
+                 and r["fix"].get("via") == "api"]
+    load_env_file()
+    have_key = bool(os.environ.get("ANTHROPIC_API_KEY")
+                    or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+    try:
+        import anthropic  # noqa: F401
+        sdk = "installed"
+    except Exception:
+        sdk = "MISSING (pip install anthropic)"
+    print("api      : %s%s"
+          % ("on" if api_enabled() else "off (CLAUDE_RESYNC_API=0)",
+             ", model %s, %.0fs timeout" % (API_MODEL, API_TIMEOUT_S)
+             if api_enabled() else ""))
+    print("  rules    : %s" % (" ".join(api_rules) or "none"))
+    print("  sdk      : %s" % sdk)
+    print("  key      : %s  (%s)"
+          % ("found" if have_key else "NOT FOUND — falls back to templates",
+             ENVFILE))
+
     if os.path.exists(FIRES):
         import collections
         c, surfaced, deduped, times = collections.Counter(), 0, 0, []
@@ -803,7 +1020,15 @@ def main(argv=None):
     ap.add_argument("--dry-run", metavar="PROMPT", default=None,
                     help="evaluate a prompt without writing fires.jsonl")
     ap.add_argument("--verdict", metavar="REPLY", default=None,
-                    help="show how a reply would be parsed as a verdict")
+                    help="show how a reply would be parsed as a verdict; with "
+                         "--label, the verdict to record")
+    ap.add_argument("--label", metavar="RULE", default=None,
+                    help="record a verdict for RULE (needs --key and "
+                         "--verdict applies|does-not-apply)")
+    ap.add_argument("--key", default=None, help="fire_key, with --label")
+    ap.add_argument("--session", default=None, help="session id, with --label")
+    ap.add_argument("--note", default=None,
+                    help="the answer verbatim, with --label")
     args = ap.parse_args(argv)
 
     if args.install:
@@ -812,6 +1037,9 @@ def main(argv=None):
         return do_install(remove=True)
     if args.status:
         return do_status()
+    if args.label:
+        return do_label(args.label, args.key, args.verdict, args.note,
+                        args.session)
     if args.verdict is not None:
         print(parse_verdict(args.verdict))
         return 0
