@@ -980,7 +980,8 @@ def do_recent(limit=20, rule=None, session=None, todo_only=False):
     return 0
 
 
-def do_label(rule, key, verdict, note=None, session_id=None):
+def do_label(rule, key, verdict, note=None, session_id=None,
+             synthetic=False):
     """Record a verdict given in conversation. Called by the assistant, not by
     the hook — see record_verdict_directive.
 
@@ -1002,6 +1003,9 @@ def do_label(rule, key, verdict, note=None, session_id=None):
         "fire_key": key, "verdict": verdict,
         "note": re.sub(r"\s+", " ", note or "")[:400],
         "source": "assistant-classified", "phase": phase(),
+        # A verdict on a message written to exercise the plumbing is not
+        # evidence about the rule. Readers drop these rather than counting them.
+        "synthetic": bool(synthetic),
     }])
     cleared = False
     if session_id:
@@ -1204,6 +1208,9 @@ def main(argv=None):
     ap.add_argument("--session", default=None, help="session id, with --label")
     ap.add_argument("--note", default=None,
                     help="the answer verbatim, with --label")
+    ap.add_argument("--synthetic", action="store_true",
+                    help="with --label: this fire was on a message written to "
+                         "test the plumbing, so exclude it from precision")
     ap.add_argument("--recent", nargs="?", type=int, const=20, default=None,
                     metavar="N",
                     help="list the last N fires (default 20) with their keys, "
@@ -1225,7 +1232,7 @@ def main(argv=None):
         return do_recent(args.recent, args.rule, args.session, args.todo)
     if args.label:
         return do_label(args.label, args.key, args.verdict, args.note,
-                        args.session)
+                        args.session, args.synthetic)
     if args.verdict is not None:
         print(parse_verdict(args.verdict))
         return 0

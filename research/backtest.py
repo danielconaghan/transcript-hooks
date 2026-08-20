@@ -240,6 +240,13 @@ def load_user_labels():
                 d = json.loads(line)
             except Exception:
                 continue
+            if d.get("synthetic"):
+                # A verdict on a message written to test the plumbing is not
+                # evidence about the rule. Without this flag such a row is
+                # indistinguishable from a real one, and one test message
+                # became R06's only "confirmation".
+                out.pop((d.get("rule"), d.get("fire_key")), None)
+                continue
             v = d.get("verdict")
             if d.get("rule") and d.get("fire_key") and v in ("applies",
                                                              "does-not-apply"):
