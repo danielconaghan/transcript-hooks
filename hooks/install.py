@@ -12,6 +12,8 @@ Everything installed lives in one global home, `~/.claude-resync`:
         refined/             # lossless reduction (0700, gitignored)
         data/                # fires.jsonl, labels.jsonl, error logs
         intercept-cache/     # per-session incremental state
+        .venv/               # the anthropic SDK, for API-drafted fixes
+        .env                 # ANTHROPIC_API_KEY (0600), never in the repo
 
 The source repo is canonical; this deploys from it. Hook commands reference
 $HOME/.claude-resync rather than a repo path, so moving or deleting the repo
@@ -67,6 +69,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 
 # The six capture points, plus the tool-failure event (a distinct kind of churn
@@ -309,6 +312,76 @@ RUNTIME_FILES = [
 ]
 
 
+ENVFILE_TEMPLATE = """\
+# Credentials for claude-resync's API-drafted fixes.
+# Read by intercept.py because a hook does not inherit your shell's exports.
+# A real exported variable always wins over this file.
+#
+# ANTHROPIC_API_KEY=sk-ant-...
+#
+# Turn every outbound call off without editing the catalogue:
+# CLAUDE_RESYNC_API=0
+"""
+
+
+def venv_dir(dest_dir):
+    return os.path.join(dest_dir, ".venv")
+
+
+def venv_python(dest_dir):
+    return os.path.join(venv_dir(dest_dir), "bin", "python")
+
+
+def sdk_present(dest_dir):
+    """Whether intercept.py will be able to import anthropic.
+
+    Mirrors intercept.import_anthropic(): the interpreter version is part of the
+    path, so a venv built against another python does not count."""
+    site = os.path.join(venv_dir(dest_dir), "lib",
+                        "python%d.%d" % sys.version_info[:2], "site-packages")
+    return os.path.isdir(os.path.join(site, "anthropic"))
+
+
+def ensure_sdk(dest_dir):
+    """Create ~/.claude-resync/.venv and install the anthropic SDK.
+
+    A venv rather than the system python because homebrew's is PEP 668
+    externally-managed and refuses `pip install`. Best-effort by design: without
+    the SDK every API-drafted fix falls back to its template, so a machine with
+    no network still gets a working install. Returns a status string."""
+    if sdk_present(dest_dir):
+        return "already present"
+    try:
+        if not os.path.isdir(venv_dir(dest_dir)):
+            subprocess.run([sys.executable, "-m", "venv", venv_dir(dest_dir)],
+                           check=True, capture_output=True, timeout=120)
+        subprocess.run([os.path.join(venv_dir(dest_dir), "bin", "pip"),
+                        "install", "--quiet", "anthropic"],
+                       check=True, capture_output=True, timeout=300)
+    except FileNotFoundError:
+        return "SKIPPED (no venv/pip available)"
+    except subprocess.TimeoutExpired:
+        return "SKIPPED (timed out)"
+    except subprocess.CalledProcessError as exc:
+        tail = (exc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        return "SKIPPED (%s)" % (tail[-1][:70] if tail else "pip failed")
+    return "installed" if sdk_present(dest_dir) else "SKIPPED (import path mismatch)"
+
+
+def ensure_envfile(dest_dir):
+    """Write the .env template if absent. Never overwrites — it holds a key."""
+    p = os.path.join(dest_dir, ".env")
+    if os.path.exists(p):
+        return "exists (left alone)"
+    try:
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(ENVFILE_TEMPLATE)
+        os.chmod(p, 0o600)
+    except OSError as exc:
+        return "could not create: %s" % exc
+    return "created (add your key)"
+
+
 def repo_root():
     """This installer lives in hooks/, so the repo is one level up."""
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -429,6 +502,9 @@ def cmd_install(args):
     dest = deployed[0]
     cpath = corpus_path()
     ensure_corpus(cpath)
+    env_state = ensure_envfile(recorder_dir())
+    sdk_state = ("SKIPPED (--no-sdk)" if args.no_sdk
+                 else ensure_sdk(recorder_dir()))
 
     # 2. merge hooks (strip-then-add makes this idempotent)
     settings = load_settings(spath)
@@ -454,6 +530,9 @@ def cmd_install(args):
         print("             %s" % os.path.basename(d))
     print("  intercept: %s" % ("registered" if not args.no_intercept
                                else "NOT registered (--no-intercept)"))
+    print("  sdk      : %s  (%s)" % (sdk_state, venv_dir(recorder_dir())))
+    print("  .env     : %s  (%s)"
+          % (env_state, os.path.join(recorder_dir(), ".env")))
     print("  corpus   : %s  (global, 0700, gitignored)" % cpath)
     print("  records  : %s" % ("ALL sessions on this machine"
                                if is_global else "sessions in %s" % os.path.abspath(project)))
@@ -502,6 +581,25 @@ def cmd_status(args):
         if isinstance(settings.get("env"), dict) else None
     print("Compaction window (CLAUDE_CODE_AUTO_COMPACT_WINDOW): %s"
           % (win if win else "unset (default)"))
+
+    ihooks = hooks.get("UserPromptSubmit", []) if isinstance(hooks, dict) else []
+    ifound = any(is_ours(c.get("command")) and "intercept.py" in (c.get("command") or "")
+                 for g in ihooks if isinstance(g, dict)
+                 for c in g.get("hooks", []) if isinstance(c, dict))
+    print("Pre-send interceptor:")
+    print("  [%s] UserPromptSubmit" % ("x" if ifound else " "))
+
+    rdir = recorder_dir()
+    drift = catalogue_drift(rdir)
+    print("  catalogue  : %s"
+          % ("DRIFTED from the repo — re-run install" if drift
+             else "in sync with the repo"))
+    print("  sdk        : %s" % ("present" if sdk_present(rdir)
+                                 else "missing — API fixes use templates"))
+    print("  .env       : %s" % ("present" if os.path.exists(
+        os.path.join(rdir, ".env")) else "absent"))
+    print("  (rule routing, fire and verdict counts: "
+          "python3 %s/intercept.py --status)" % rdir)
 
     cpath = corpus_path()
     sessions, snaps, total = _corpus_stats(cpath)
@@ -595,6 +693,9 @@ def build_parser():
     sp.add_argument("--no-intercept", action="store_true",
                     help="deploy and register capture only, leaving the "
                          "pre-send interceptor unregistered")
+    sp.add_argument("--no-sdk", action="store_true",
+                    help="skip creating .venv / installing the anthropic SDK. "
+                         "API-drafted fixes then fall back to templates")
     sp.add_argument("--window", type=int, default=None,
                     help="set CLAUDE_CODE_AUTO_COMPACT_WINDOW (>= %d; %d+ recommended)"
                          % (WINDOW_HARD_FLOOR, WINDOW_SAFE))

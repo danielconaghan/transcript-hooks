@@ -109,7 +109,7 @@ and the corpus intact.
 ### Inspect / reset the corpus
 
 ```bash
-python3 hooks/install.py status                       # what's registered + corpus stats
+python3 hooks/install.py status                       # hooks, catalogue drift, sdk/.env, corpus
 python3 hooks/install.py clear  --yes                 # wipe the global corpus in one command
 python3 hooks/install.py prune  --older-than-days 7 --yes
 python3 hooks/install.py prune  --keep-sessions 10 --yes
@@ -282,15 +282,37 @@ logs every fire to `data/fires.jsonl`, and injects context for the rules that
 never interrupt you. Typical latency **0–1 ms**; state is read incrementally
 using a byte offset, so a long session costs no more than a short one.
 
-Currently phase 2: the six non-interrupting rules inject, the other seven log
-only. Nothing asks you anything yet. See `PLAN.md` for phase 3 (asking, and
-feeding your verdicts back into measured precision) and for the verified
-platform facts it depends on.
+Currently phase 3. Silent rules inject every turn; interrupting rules inject
+once per *cause* and then record your verdict. A rule measured below 30%
+precision never reaches you, and a rule whose premise turns out to be false can
+be `suspended` — it keeps firing and logging, but never surfaces, so its counts
+stay comparable without anyone inventing a figure to demote it with.
+
+Fixes come from the `fix` template in `rules.json`, or are drafted by the API
+when the wording needs reading the situation rather than restating it. The
+template is always the fallback, so enabling the API can improve an injection
+but never remove one. Credentials go in `~/.claude-resync/.env` (a hook does not
+inherit your shell's exports) and the SDK lives in `~/.claude-resync/.venv`,
+both created by `install.py`.
+
+`CLAUDE_RESYNC_PHASE=2` reverts to silent-only; `CLAUDE_RESYNC_API=0` stops
+every outbound call. See `PLAN.md` for the verified platform facts, phase 4, and
+what is known to be wrong.
 
 ```bash
-python3 hooks/intercept.py --status                  # what is registered, what has fired
+python3 hooks/intercept.py --status                  # routing, fires, verdicts, api state
 python3 hooks/intercept.py --dry-run "some prompt"   # evaluate without recording
+python3 hooks/intercept.py --recent --todo           # fires with no verdict yet
+python3 hooks/intercept.py --label R06 --key K --verdict applies --note "..."
+python3 hooks/intercept.py --verdict "no"            # how a reply would parse
 ```
+
+Three paths write `data/labels.jsonl`, each tagged with its `source`:
+`assistant-classified` (the assistant reads your answer and records it),
+`verdict-reply` (a leading yes/no parsed by the hook — a fallback, since only
+~5% of real replies parse), and `manual-review` (`backtest.py --review`, the
+only route for silent rules and the only way a demoted rule earns its way
+back).
 
 ## Shared engine (`rules_engine.py`)
 
@@ -340,6 +362,8 @@ on where this repo sits:
   refined/             lossless reduction
   data/                fires.jsonl, labels.jsonl, error logs
   intercept-cache/     per-session incremental state
+  .venv/               the anthropic SDK, for API-drafted fixes
+  .env                 ANTHROPIC_API_KEY (0600), never in the repo
 ```
 
 `rules.json` is the one file that flows both ways: canonical in the repo,
