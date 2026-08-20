@@ -55,6 +55,7 @@ import rules_engine as E   # noqa: E402
 import backtest as B       # noqa: E402
 
 VERDICTS = os.path.join(B.resync_home(), "data", "desync.jsonl")
+DIRECTIVES = os.path.join(B.resync_home(), "data", "directive.jsonl")
 
 # Not labels.jsonl. That file is keyed on (rule, fire_key) and answers "was this
 # rule right about this fire". This answers "was this message a desync at all",
@@ -149,6 +150,100 @@ SCHEMA = {
 }
 
 
+DIRECTIVE_SYSTEM = """\
+You are analysing a developer's message to an AI coding assistant, to judge how \
+strongly it directs the assistant.
+
+A DIRECTIVE is anything that should change what the assistant does: an \
+instruction, a correction of a fact the assistant is working from, a report that \
+something is broken, or a statement of what the developer wants. A message can \
+be a directive without containing an imperative.
+
+Judge how the directive is DELIVERED, not how important it is:
+
+  direct     An unambiguous instruction or assertion. "please fix X",
+             "insights are no more", "open crm-launch is not serving".
+             Politeness markers — "please", "can you", "could you" — do NOT
+             weaken a directive. In this register they are ordinary and carry
+             full force. Never mark a message weakened merely for being polite.
+  weakened   The force is reduced by how it is phrased, so a reader could take
+             it as optional, as curiosity, or as an open question when it is
+             not. Record which form in `weakening`:
+               hedge           "i think", "i believe", "looks like", "not
+                               sure", "maybe", "i would like to", "i thought"
+               understatement  the problem described as smaller than it is:
+                               "a slight issue", "a bit off", "minor problem"
+               interrogative   an assertion or instruction delivered as a
+                               question: "should it be taking this long?",
+                               "Are you aware that v4 and v5 have different
+                               microservices?", "the monthly ones haven't run
+                               in the last month, so i think they should be run
+                               as well?"
+  none       Not a directive at all. Reserve this for a message that seeks
+             information and asserts nothing: "where is login?", "what does
+             ./do down stop?". Also an answer to something the assistant asked,
+             or pasted reference material.
+
+`none` is over-used. Before choosing it, check for these, which ARE directives:
+
+  * A report that something is broken or still broken. "still getting a 500 on
+    /clients/HNW" names no action but demands one — it is `direct`.
+  * A claim embedded in a question. "what does admin send to org, crm is a new
+    version of org, would that matter?" contains the correction "crm is a new
+    version of org". The question is the wrapper; the correction is the
+    payload. That is `weakened` / `interrogative`, and it is the single most
+    important case to get right.
+  * A preference stated as an observation. "it worked literally today before we
+    ran the full delete" is a report that the change broke it.
+
+The distinction that matters is whether a reader could reasonably UNDER-WEIGHT
+it — treat a correction as curiosity, or an instruction as an open question.
+
+`content` is a short paraphrase of what the developer wants done or believed,
+under 15 words. Empty only when strength is "none".
+
+Scoring your own certainty is part of the job. A pilot returned "high" on 12 of
+12, which is not credible:
+
+  high    The delivery is unambiguous and you could defend it to someone
+          reading the same message.
+  medium  It could be read either way — a report or a passing remark, an
+          instruction or a musing. Most honest judgements are here.
+  low     Genuinely ambiguous. You would not defend either answer.
+
+Politeness and indirectness saturate this corpus: "please", "can you", "would
+you mind" are the normal register and carry FULL force. Their presence alone
+must never push you to "weakened". What makes something weakened is that the
+claim or instruction is buried, softened by uncertainty it does not really
+have, or made smaller than it is.\
+"""
+
+DIRECTIVE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "is_directive": {"type": "boolean"},
+        "strength": {"type": "string", "enum": ["direct", "weakened", "none"]},
+        "weakening": {"type": "string", "enum": [
+            "none", "hedge", "understatement", "interrogative", "multiple"]},
+        "content": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["is_directive", "strength", "weakening", "content",
+                 "confidence", "reason"],
+    "additionalProperties": False,
+}
+
+# Two orthogonal questions about the same messages, kept in separate files for
+# the same reason desync verdicts stay out of labels.jsonl: a judgement about
+# one thing must never be able to masquerade as evidence about another.
+JUDGEMENTS = {
+    "desync":    {"path": VERDICTS,   "system": SYSTEM,
+                  "schema": SCHEMA},
+    "directive": {"path": DIRECTIVES, "system": DIRECTIVE_SYSTEM,
+                  "schema": DIRECTIVE_SCHEMA},
+}
+
 # Defined in backtest so both sides hash identically — a verdict written here
 # has to be findable by the replay that consumes it, and two copies of a hash
 # function is exactly how that quietly stops being true.
@@ -192,11 +287,12 @@ def collect(limit=None):
     return out
 
 
-def load_cache():
+def load_cache(path=None):
     got = {}
-    if not os.path.exists(VERDICTS):
+    path = path or VERDICTS
+    if not os.path.exists(path):
         return got
-    with open(VERDICTS, errors="replace") as fh:
+    with open(path, errors="replace") as fh:
         for line in fh:
             try:
                 d = json.loads(line)
@@ -207,33 +303,30 @@ def load_cache():
     return got
 
 
-def append(rows):
+def append(rows, path=None):
     if not rows:
         return
-    os.makedirs(os.path.dirname(VERDICTS), mode=0o700, exist_ok=True)
-    with open(VERDICTS, "a", encoding="utf-8") as fh:
+    path = path or VERDICTS
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
         for r in rows:
             fh.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
-    os.chmod(VERDICTS, 0o600)
+    os.chmod(path, 0o600)
 
 
-def classify_one(client, model, item):
+def classify_one(client, model, item, judgement="desync"):
+    spec = JUDGEMENTS[judgement]
     key, sid, prior, text = item
     user = ("ASSISTANT'S PREVIOUS TURN:\n%s\n\n"
             "DEVELOPER'S MESSAGE:\n%s"
             % ((prior[:3000] or "(nothing — this is the first message)"),
                text[:3000]))
-    kwargs = {}
+    fmt = {"format": {"type": "json_schema", "schema": spec["schema"]}}
     if not model.startswith(NO_EFFORT_MODELS):
-        kwargs["output_config"] = {"effort": "low",
-                                   "format": {"type": "json_schema",
-                                              "schema": SCHEMA}}
-    else:
-        kwargs["output_config"] = {"format": {"type": "json_schema",
-                                              "schema": SCHEMA}}
+        fmt["effort"] = "low"
     resp = client.messages.create(
-        model=model, max_tokens=1000, system=SYSTEM,
-        messages=[{"role": "user", "content": user}], **kwargs)
+        model=model, max_tokens=1000, system=spec["system"],
+        messages=[{"role": "user", "content": user}], output_config=fmt)
     if resp.stop_reason == "refusal":
         raise RuntimeError("refused")
     blob = next(b.text for b in resp.content if getattr(b, "type", None) == "text")
@@ -255,10 +348,16 @@ def main(argv=None):
     ap.add_argument("--compare", action="store_true",
                     help="compare cached verdicts against gaps.py's regexes")
     ap.add_argument("--show", action="store_true", help="print cached verdicts")
+    ap.add_argument("--judge", choices=sorted(JUDGEMENTS), default="desync",
+                    help="which judgement to make: 'desync' (was this message "
+                         "where a desync surfaced) or 'directive' (is it a "
+                         "directive, and is its force weakened). Separate "
+                         "files, separate questions")
     ap.add_argument("--workers", type=int, default=6)
     args = ap.parse_args(argv)
+    spec = JUDGEMENTS[args.judge]
 
-    cache = load_cache()
+    cache = load_cache(spec['path'])
 
     if args.show or args.compare:
         if not cache:
@@ -315,7 +414,7 @@ def main(argv=None):
 
     rows, errors = [], collections.Counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(classify_one, client, args.model, it): it
+        futs = {ex.submit(classify_one, client, args.model, it, args.judge): it
                 for it in todo}
         for n, fut in enumerate(concurrent.futures.as_completed(futs), 1):
             try:
@@ -324,15 +423,23 @@ def main(argv=None):
                 errors[type(exc).__name__] += 1
             if n % 10 == 0 or n == len(todo):
                 print("  %d/%d" % (n, len(todo)))
-    append(rows)
-    print("\nwrote %d verdict(s) -> %s" % (len(rows), VERDICTS))
+    append(rows, spec["path"])
+    print("\nwrote %d verdict(s) -> %s" % (len(rows), spec["path"]))
     if errors:
         print("errors: %s" % dict(errors))
-    d = collections.Counter((r["desync"], r["kind"]) for r in rows)
-    print("\n%-8s %-14s %s" % ("desync", "kind", "count"))
-    for (yes, kind), c in d.most_common():
-        print("%-8s %-14s %d" % ("yes" if yes else "no", kind, c))
-    print("\nnext: --compare to see where this disagrees with the regexes")
+    if args.judge == "desync":
+        d = collections.Counter((r["desync"], r["kind"]) for r in rows)
+        print("\n%-8s %-14s %s" % ("desync", "kind", "count"))
+        for (yes, kind), c in d.most_common():
+            print("%-8s %-14s %d" % ("yes" if yes else "no", kind, c))
+        print("\nnext: --compare to see where this disagrees with the regexes")
+    else:
+        d = collections.Counter((r["strength"], r["weakening"]) for r in rows)
+        print("\n%-10s %-16s %s" % ("strength", "weakening", "count"))
+        for (st, wk), c in d.most_common():
+            print("%-10s %-16s %d" % (st, wk, c))
+        conf = collections.Counter(r["confidence"] for r in rows)
+        print("\nconfidence: %s" % dict(conf))
     return 0
 
 
