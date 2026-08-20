@@ -283,7 +283,9 @@ never interrupt you. Typical latency **0–1 ms**; state is read incrementally
 using a byte offset, so a long session costs no more than a short one.
 
 Currently phase 2: the six non-interrupting rules inject, the other seven log
-only. Nothing asks you anything yet.
+only. Nothing asks you anything yet. See `PLAN.md` for phase 3 (asking, and
+feeding your verdicts back into measured precision) and for the verified
+platform facts it depends on.
 
 ```bash
 python3 hooks/intercept.py --status                  # what is registered, what has fired
