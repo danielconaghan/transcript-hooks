@@ -48,7 +48,7 @@
         "sessions": 6,
         "human_enqueues": 52,
         "retraction_rate_pct": 63.0,
-        "precision": 1.0,
+        "precision": null,
         "measured_cost": "11 min (a0c27fd2 case_ref, arrived reworded later); unmeasured but non-zero for the rest",
         "backtest": {
           "fires": 31,
@@ -59,7 +59,7 @@
           "sessions": 9,
           "precision_labelled": 1.0
         },
-        "precision_caveat": "backtest reports 1.0; live 0 of 2. The trigger cannot distinguish a withdrawal from a queued-then-delivered message. Treat as unmeasured."
+        "precision_caveat": "null, not 1.0. The old 33/33 came from an auto-label that restated the trigger (backtest BASIS R01 is now 'tautological'). Live: 0 of 2."
       },
       "evidence": [
         {
@@ -93,7 +93,7 @@
           "outcome": "never sent — a desync the user noticed and did not report"
         }
       ],
-      "verification": "`remove` was confirmed not to mean `sent`: matching all 37 human retractions against real user messages in both time directions gives 33 with no counterpart anywhere, 3 identical matches 46-147s EARLIER (queue cleanup following a send), and 1 re-sent 27 min later. Cleanup with nothing to clean up is not a thing, so the 33 stand.",
+      "verification": "FALSIFIED - retained for the record. Previously: '`remove` was confirmed not to mean `sent`: matching all 37 human retractions against real user messages in both time directions gives 33 with no counterpart anywhere.' That match cannot see a same-turn delivery, which writes no user message, so 'no counterpart' never implied 'not delivered'. The 33 are unclassified, not confirmed.",
       "known_limit": "Lexical matching cannot detect a semantic re-send. The a0c27fd2 case_ref draft scores 0.37 similarity and lands in `never sent`, yet its content did arrive 11 minutes later reworded. Read 33 as `withheld verbatim`, with an unknown subset arriving reworded. LIVE FALSE POSITIVE, 2026-08-20: a mid-turn interjection in session 0825c6b6 fired R01 despite being delivered and acted on. Such a message produces enqueue + remove + queued_command and NO `type: user` line, so the check 'no similar user message exists' cannot see the delivery. The queued_command fields are byte-identical to a genuine withdrawal (commandMode='prompt', origin={'kind':'human'}), and the enqueue->remove gap does not separate the cases (39 human removes: 3 at <=1s, 10 at 2-5s, 20 at 5-30s, 4 beyond). So precision 1.0 is NOT established — it is confirmed/fires under a check blind to this delivery path. Treat it as an upper bound until mid-turn deliveries can be identified. MECHANISM (Daniel, 2026-08-20): the enqueue+remove pair is produced by the client's input handling, not by a decision to withdraw. Text sitting in the input box while the assistant is busy is enqueued, then removed and DELIVERED when the turn yields - often because the assistant asked a question or hit a permission prompt. Delivery leaves no `type: user` line, so the `check` above ('no similar user message exists') cannot see it. This undermines the EVIDENCE base, not only the precision figure: every evidence item was classed 'never sent' because its content is absent from user messages, and absence no longer implies non-delivery. Live score in session 0825c6b6: 0 of 2. Re-derive on a delivery signal, not on absence.",
       "requires_fields": [
         "queue-operation.operation",
@@ -101,7 +101,9 @@
         "user message text"
       ],
       "confidence": "high",
-      "fix": "You wrote and withdrew a draft that was never sent: \"{detail}\". Ask whether it should be treated as context before acting."
+      "fix": "You wrote and withdrew a draft that was never sent: \"{detail}\". Ask whether it should be treated as context before acting.",
+      "suspended": true,
+      "suspended_reason": "Premise falsified 2026-08-20. The trigger assumes a queue-operation `remove` carrying human content means the draft was withheld. It does not: `remove` is the record of a queued human message LEAVING the queue, which includes delivery. Evidence: (a) `dequeue` has 0 human-authored uses across the corpus while `remove` has 41, so human messages never dequeue - they remove; (b) both live R01 fires in session 0825c6b6 were confirmed deliveries, acted on by the assistant, labelled does-not-apply; (c) the docs' 'Take back what you queued' describes Up pulling a queued message back into the input box, which is a second, indistinguishable cause of the same `remove`; (d) a same-turn delivery writes no `type: user` line, so the `check` could never observe delivery. Fires and logs but never surfaces until a delivery signal exists that is not 'content absent from user messages'."
     },
     {
       "id": "R02",

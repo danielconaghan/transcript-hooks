@@ -1078,10 +1078,20 @@ def do_status():
                         ("ask", "injects a directive, verdict recorded")):
         print("  %-8s : %-24s (%s)"
               % (name, " ".join(buckets.get(name, [])) or "-", gloss))
-    floored = buckets.get("log", [])
+    by_id = {r["id"]: r for r in cat["rules"]}
+    logged = buckets.get("log", [])
+    suspended = [r for r in logged if by_id.get(r, {}).get("suspended")]
+    floored = [r for r in logged if r not in suspended]
     if floored:
         print("  log only : %s  (precision below the %.0f%% floor)"
               % (" ".join(floored), E.PRECISION_FLOOR * 100))
+    if suspended:
+        print("  suspended: %s  (premise falsified — fires and logs, never "
+              "surfaces)" % " ".join(suspended))
+        for rid in suspended:
+            why = (by_id.get(rid, {}).get("suspended_reason") or "").split(".")[0]
+            if why:
+                print("             %s: %s." % (rid, why))
     print("  budget   : max %d interrupting fire(s) per session, once per cause"
           % MAX_ASKS_PER_SESSION)
 

@@ -96,7 +96,11 @@ RE_CORRECTION = re.compile(
 # How each rule's fires are judged. Kept here, never in the engine: the engine
 # must not know that a future exists.
 BASIS = {
-    "R01": "auto", "R02": "tautological", "R03": "tautological",
+    # R01 was "auto" and reported 33/33. Its label restated its trigger, and
+    # the trigger's premise is falsified — see the note in label(). Do not put
+    # it back to "auto" without a delivery signal that is not "the content is
+    # absent from user messages".
+    "R01": "tautological", "R02": "tautological", "R03": "tautological",
     "R04": "auto-proxy", "R05": "hindsight", "R06": "hindsight",
     "R07": "auto", "R08": "none", "R09": "none", "R10": "auto",
     "R11": "manual", "R12": "auto", "R13": "none",
@@ -257,11 +261,14 @@ def label(rule, fire, msg, session, user_labels):
                       "manual": "needs a human to compare both messages",
                       "none": "not labellable from this data"}[basis]
 
-    if rule == "R01":
-        # The engine already dropped retractions matching a sent message, so
-        # every surviving fire is a genuine withholding. The refuted cases show
-        # up as retractions the engine never turned into fires.
-        return True, "no counterpart message anywhere in the session"
+    # R01 used to auto-label True here, reasoning that "the engine already
+    # dropped retractions matching a sent message, so every surviving fire is a
+    # genuine withholding". That is the trigger restated, not an independent
+    # fact, and it is the whole source of the old 33/33. Worse, its premise is
+    # false: `remove` is the delivery record for a queued human message
+    # (`dequeue` has zero human-authored uses in the corpus), and a same-turn
+    # delivery writes no `type: user` line for the match to find. R01 is now
+    # basis `tautological` and reports null until hand-labelled.
 
     if rule == "R07":
         # "a duplicate arrived" restates the trigger. Only a negation flip is

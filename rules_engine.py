@@ -472,6 +472,13 @@ def action_for(rule_id, catalogue, precision_threshold=PRECISION_CEILING,
     rule = next((r for r in catalogue["rules"] if r["id"] == rule_id), None)
     if rule is None:
         return "skip"
+    if rule.get("suspended"):
+        # A rule whose premise has been falsified must stop reaching the user
+        # without anyone inventing a precision figure to demote it with. It
+        # keeps firing and keeps being recorded, so the fires stay available to
+        # hand-review and the counts stay comparable to the day it is fixed.
+        # See the rule's `suspended_reason`.
+        return "log"
     act = rule.get("action")
     if act in ("augment", "annotate", "resend"):
         return "augment"
