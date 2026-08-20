@@ -275,6 +275,37 @@ python3 research/backtest.py --rule R01      # one rule, listing its fires
 python3 research/backtest.py --write         # fold precision into rules.json
 ```
 
+## Gap analysis (`research/gaps.py`)
+
+`backtest.py` answers *"are the rules we have right?"*. This answers the other
+half — *"what are we missing?"* — and it is where a new rule should come from,
+rather than from memory.
+
+It cross-references every historical message against families of *desync
+signal* (a correction, a re-ask, a question about whether anything is
+happening) and reports the messages where something clearly went wrong and no
+rule responded.
+
+Two adjustments keep the number honest. `R13` is excluded, since it fires on
+every message and would report total coverage of everything. And **content-blind
+fires are counted separately**: `R03` fires on a session's first message
+whatever it says, and `R05`/`R06`/`R08` on any mention of an endpoint, path or
+URL — a correction that happens to name a file is not a correction the catalogue
+understood. On the 50-session corpus that distinction takes corrections from an
+apparent 63% coverage to a real 37%.
+
+```bash
+python3 research/gaps.py                     # coverage table + samples
+python3 research/gaps.py --signal state-ask  # one family, every message
+```
+
+Everything in it is deterministic — no model reads the corpus. A model is useful
+for the *last* step only: reading the twenty or thirty uncovered messages it
+prints and proposing a trigger. That sample fits in a context window; the corpus
+does not. The irreducibly manual part is the `SIGNALS` dict itself, so a pattern
+nobody thought of stays invisible; treat a new family as a hypothesis to add
+there, not a rule to ship.
+
 ## Interception (`hooks/intercept.py`)
 
 A `UserPromptSubmit` hook. Rebuilds the pre-send state, evaluates the rules,
@@ -345,6 +376,7 @@ claude-resync/
   research/            run by hand: may be slow, may crash
     reduce.py            lossless corpus reduction + verification
     backtest.py          replay the rules over history, measure precision
+    gaps.py              find desync signals no rule responds to
 ```
 
 The split is not cosmetic. Anything under `hooks/` runs on every prompt or tool

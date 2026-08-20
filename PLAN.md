@@ -513,10 +513,18 @@ untouched. A hook that can break a session is worse than no hook.
 
 ## Loose ends
 
-- **`view.py` was specced and never written.** Named narrow projections over
-  `refined/`. Deferred deliberately: the four views that serve the goal are
-  `claims`, `undelivered`, `unanswered`, `repair`, and the earlier nine-view
-  design was instrumentation rather than findings. Not needed until phase 4.
+- **`view.py` was specced and never written**, and `research/gaps.py` now
+  overlaps part of it. Views were to be named narrow projections over
+  `refined/` — `claims`, `undelivered`, `unanswered`, `repair`. `gaps.py`
+  effectively delivers the `repair`-shaped question (where did the user have to
+  correct us, and did anything fire?) as a coverage report rather than a
+  projection. Decide whether `view.py` still earns its place before writing it;
+  do not build a second tool over the same ground.
+- **`research/gaps.py` is the input to any new rule.** Added 2026-08-20. It
+  measures what the catalogue misses, so candidate rules come from evidence
+  rather than recall. Its `SIGNALS` dict is the manual part and bounds what it
+  can see — a signal family nobody added is invisible, which is why a new family
+  is a hypothesis rather than a finding.
 - **The corpus is unpruned** (14 GB) and staying that way by choice.
   `reduce.py --prune-corpus --session <sid>` works and refuses unless verify
   passes, if that ever changes.
