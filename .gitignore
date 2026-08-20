@@ -4,8 +4,15 @@ __pycache__/
 .venv/
 venv/
 
-# The corpus is global (~/.claude-transcripts) and never lands in this repo.
-# These are only a belt-and-braces net (the corpus also self-ignores via a
-# .gitignore of '*' that the recorder writes).
+# Runtime data lives in ~/.claude-resync/data, never here — fires.jsonl
+# carries fragments of prompts (paths and URLs lifted from whatever message
+# fired a rule), so it is as secrets-bearing as the corpus. This entry is a
+# net in case anything is ever written locally by mistake.
+data/
+
+# The corpus and refined archive live in ~/.claude-resync, never in this repo.
+# Belt-and-braces: those dirs also self-ignore with a .gitignore of '*'.
+.claude-resync/
 .claude-transcripts/
 corpus/
+refined/

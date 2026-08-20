@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
-"""Installer / uninstaller / corpus manager for the Context Churn Recorder.
+"""Installer / uninstaller / corpus manager for claude-resync.
 
-The recorder and its corpus live in a single global home, `~/.claude-transcripts`:
+Everything installed lives in one global home, `~/.claude-resync`:
 
-    ~/.claude-transcripts/
-        recorder.py          # the deployed hook entrypoint
-        corpus/              # the shared corpus (0700, gitignored)
+    ~/.claude-resync/
+        recorder.py          # capture hook entrypoint
+        intercept.py         # pre-send interception hook entrypoint
+        rules_engine.py      # shared triggers, imported by intercept.py
+        rules.json           # the rule catalogue (deployed copy)
+        corpus/              # raw captures (0700, gitignored)
+        refined/             # lossless reduction (0700, gitignored)
+        data/                # fires.jsonl, labels.jsonl, error logs
+        intercept-cache/     # per-session incremental state
+
+The source repo is canonical; this deploys from it. Hook commands reference
+$HOME/.claude-resync rather than a repo path, so moving or deleting the repo
+cannot break a live session.
+
+rules.json is the one file that flows BOTH ways: it is hand-edited and
+git-tracked in the repo, `research/backtest.py --write` updates the repo copy
+with measured precision, and install deploys it. `status` reports when the
+deployed copy has drifted from the repo so a stale catalogue is visible rather
+than silently in force.
 
 All captured data lands in that one global corpus regardless of which project
 triggered the hook. What varies is *which sessions get recorded*, controlled by
@@ -68,17 +84,39 @@ EVENTS = [
 ]
 
 # The recorder's global home. Kept in sync with recorder.transcripts_home().
-TRANSCRIPTS_HOME = os.path.join(os.path.expanduser("~"), ".claude-transcripts")
+TRANSCRIPTS_HOME = (os.environ.get("CLAUDE_RESYNC_HOME")
+                    or os.environ.get("CLAUDE_TRANSCRIPTS_HOME")
+                    or os.path.join(os.path.expanduser("~"), ".claude-resync"))
 
 # Substring that uniquely identifies a hook command as belonging to this
 # recorder. Used for idempotent install and for surgical uninstall.
-SENTINEL = ".claude-transcripts/recorder.py"
+# Substrings identifying a hook command as ours, for idempotent install and
+# surgical uninstall. Path-qualified rather than bare filenames so we never
+# strip an unrelated hook that happens to mention "recorder.py". Both the
+# current home and the pre-rename one are listed, so uninstall still works on
+# an install that predates the rename.
+SENTINELS = (
+    ".claude-resync/recorder.py",
+    ".claude-resync/intercept.py",
+    ".claude-transcripts/recorder.py",     # legacy
+    ".claude-transcripts/intercept.py",    # legacy
+)
+SENTINEL = SENTINELS[0]                    # retained for existing references
+SENTINEL_INTERCEPT = SENTINELS[1]
+
+
+def is_ours(command):
+    return isinstance(command, str) and any(x in command for x in SENTINELS)
 
 # The hook command. $HOME is expanded by the shell inside double quotes, so this
 # one form is portable across machines and works for both global and
 # project-scoped registration (the recorder is always deployed globally).
 def command_for(event):
-    return 'python3 "$HOME/.claude-transcripts/recorder.py" %s || true' % event
+    return 'python3 "$HOME/.claude-resync/recorder.py" %s || true' % event
+
+
+def intercept_command():
+    return 'python3 "$HOME/.claude-resync/intercept.py" || true'
 
 # Reserved buffer that Claude Code subtracts from the compaction window. A
 # window at or below this collapses the trigger threshold to zero and
@@ -144,9 +182,10 @@ def write_settings(path, data):
 
 
 def strip_our_hooks(settings):
-    """Remove every command hook that belongs to this recorder, pruning any
-    matcher-groups and event arrays we thereby empty. Returns count removed.
-    Leaves all non-recorder settings untouched."""
+    """Remove every command hook that belongs to us — capture AND interception,
+    current paths and pre-rename ones — pruning any matcher-groups and event
+    arrays we thereby empty. Returns count removed. Leaves everything else,
+    including other people's UserPromptSubmit hooks, untouched."""
     removed = 0
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
@@ -166,9 +205,7 @@ def strip_our_hooks(settings):
                 continue
             kept = []
             for cmd in cmds:
-                if (isinstance(cmd, dict)
-                        and isinstance(cmd.get("command"), str)
-                        and SENTINEL in cmd["command"]):
+                if isinstance(cmd, dict) and is_ours(cmd.get("command")):
                     removed += 1
                 else:
                     kept.append(cmd)
@@ -183,6 +220,23 @@ def strip_our_hooks(settings):
     if not hooks:
         del settings["hooks"]
     return removed
+
+
+def add_intercept_hook(settings):
+    """Register the pre-send interceptor. Separate from the recorder hooks: the
+    recorder is passive and always wanted, whereas interception changes what
+    Claude sees and a user may reasonably run one without the other."""
+    hooks = settings.setdefault("hooks", {})
+    groups = hooks.get("UserPromptSubmit") or []
+    kept = []
+    for g in groups:
+        inner = [h for h in (g.get("hooks") or [])
+                 if not is_ours(h.get("command"))]
+        if inner:
+            kept.append(dict(g, hooks=inner))
+    kept.append({"hooks": [{"type": "command", "command": intercept_command(),
+                            "timeout": 15}]})
+    hooks["UserPromptSubmit"] = kept
 
 
 def add_our_hooks(settings):
@@ -244,16 +298,68 @@ def check_local_shadow(cdir):
 # corpus helpers
 # --------------------------------------------------------------------------- #
 
-def deploy_recorder(dest_dir):
-    """Copy recorder.py from beside this installer into the target dir."""
-    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recorder.py")
-    if not os.path.exists(src):
-        raise SystemExit("ERROR: recorder.py not found next to install.py (%s)." % src)
+# What gets deployed, and where it comes from. hooks/ holds the two hook
+# entrypoints; the engine and the catalogue live at the repo root because both
+# the hooks and the research scripts depend on them and neither owns them.
+RUNTIME_FILES = [
+    ("hooks/recorder.py", "recorder.py", 0o755),
+    ("hooks/intercept.py", "intercept.py", 0o755),
+    ("rules_engine.py", "rules_engine.py", 0o644),
+    ("rules.json", "rules.json", 0o644),
+]
+
+
+def repo_root():
+    """This installer lives in hooks/, so the repo is one level up."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def deploy_runtime(dest_dir):
+    """Copy the runtime from the repo into the global home.
+
+    Every hook entrypoint plus everything it imports, so a deployed install has
+    no dependency on the repo remaining in place. Returns the deployed paths."""
+    root = repo_root()
     os.makedirs(dest_dir, exist_ok=True)
-    dest = os.path.join(dest_dir, "recorder.py")
-    shutil.copyfile(src, dest)
-    os.chmod(dest, 0o755)
-    return dest
+    out = []
+    for rel, name, mode in RUNTIME_FILES:
+        src = os.path.join(root, rel)
+        if not os.path.exists(src):
+            raise SystemExit("ERROR: %s not found in the repo (%s)." % (rel, src))
+        dest = os.path.join(dest_dir, name)
+        shutil.copyfile(src, dest)
+        os.chmod(dest, mode)
+        out.append(dest)
+    for sub in ("data", "intercept-cache"):
+        d = os.path.join(dest_dir, sub)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+    return out
+
+
+def deploy_recorder(dest_dir):
+    """Retained name used by cmd_install; deploys the whole runtime now."""
+    return deploy_runtime(dest_dir)[0]
+
+
+def catalogue_drift(dest_dir):
+    """True when the deployed rules.json differs from the repo's. The repo copy
+    is canonical, so drift means the running catalogue is stale."""
+    import hashlib
+    def h(p):
+        try:
+            with open(p, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()
+        except Exception:
+            return None
+    a = h(os.path.join(repo_root(), "rules.json"))
+    b = h(os.path.join(dest_dir, "rules.json"))
+    if a is None or b is None:
+        return None
+    return a != b
 
 
 def ensure_corpus(path):
@@ -318,8 +424,9 @@ def cmd_install(args):
         print("!! machine, across all projects (including their secrets).")
         print("!! Use --project PATH to restrict recording to one project.\n")
 
-    # 1. deploy the recorder + prepare the global corpus
-    dest = deploy_recorder(recorder_dir())
+    # 1. deploy the runtime + prepare the global corpus
+    deployed = deploy_runtime(recorder_dir())
+    dest = deployed[0]
     cpath = corpus_path()
     ensure_corpus(cpath)
 
@@ -327,6 +434,8 @@ def cmd_install(args):
     settings = load_settings(spath)
     removed = strip_our_hooks(settings)
     add_our_hooks(settings)
+    if not args.no_intercept:
+        add_intercept_hook(settings)
 
     # 3. optional compaction window
     warnings = []
@@ -338,9 +447,13 @@ def cmd_install(args):
     write_settings(spath, settings)
 
     # 4. report
-    print("Context Churn Recorder installed.")
+    print("claude-resync installed.")
     print("  settings : %s" % spath)
-    print("  recorder : %s" % dest)
+    print("  runtime  : %s" % os.path.dirname(dest))
+    for d in deployed:
+        print("             %s" % os.path.basename(d))
+    print("  intercept: %s" % ("registered" if not args.no_intercept
+                               else "NOT registered (--no-intercept)"))
     print("  corpus   : %s  (global, 0700, gitignored)" % cpath)
     print("  records  : %s" % ("ALL sessions on this machine"
                                if is_global else "sessions in %s" % os.path.abspath(project)))
@@ -479,6 +592,9 @@ def build_parser():
 
     sp = sub.add_parser("install", help="install/refresh the recorder hooks")
     add_target(sp)
+    sp.add_argument("--no-intercept", action="store_true",
+                    help="deploy and register capture only, leaving the "
+                         "pre-send interceptor unregistered")
     sp.add_argument("--window", type=int, default=None,
                     help="set CLAUDE_CODE_AUTO_COMPACT_WINDOW (>= %d; %d+ recommended)"
                          % (WINDOW_HARD_FLOOR, WINDOW_SAFE))
