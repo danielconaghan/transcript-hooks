@@ -520,6 +520,14 @@ untouched. A hook that can break a session is worse than no hook.
   correct us, and did anything fire?) as a coverage report rather than a
   projection. Decide whether `view.py` still earns its place before writing it;
   do not build a second tool over the same ground.
+- **`research/classify.py` supersedes gaps.py's signal detection.** Pilot
+  measured the regexes at 86% precision / ~46% recall: they missed 7 of 13 real
+  desyncs, all of them lacking correction vocabulary (a pasted stack trace, "not
+  serving and not responding"). So every coverage number gaps.py has ever
+  printed rests on a set that misses about half of what it is looking for. Next
+  step is a full `--model claude-opus-5` pass, but only after a hand spot-check:
+  the pilot came back `confidence: high` on 13 of 13, which is over-confident
+  for a task with genuine borderline cases.
 - **`research/gaps.py` is the input to any new rule.** Added 2026-08-20. It
   measures what the catalogue misses, so candidate rules come from evidence
   rather than recall. Its `SIGNALS` dict is the manual part and bounds what it

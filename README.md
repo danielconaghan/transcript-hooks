@@ -306,6 +306,35 @@ does not. The irreducibly manual part is the `SIGNALS` dict itself, so a pattern
 nobody thought of stays invisible; treat a new family as a hypothesis to add
 there, not a rule to ship.
 
+## Desync classification (`research/classify.py`)
+
+`gaps.py` decides what counts as a desync from hand-written regexes over the
+message text. That cannot work: *"did the user have to correct us?"* is a
+question about the **previous turn**, and a regex over the message cannot see
+the previous turn. This sends each message plus the assistant turn before it to
+a model and asks the actual question — 433 of 483 messages have that context.
+
+Measured on a 40-message pilot: the regexes reached **86% precision but ~46%
+recall** — they missed 7 of the 13 real desyncs, and the ones they missed were
+the valuable kind (a pasted stack trace, "not serving and not responding", "is
+not a question reference"), because none of them contain correction vocabulary.
+
+```bash
+python3 research/classify.py --limit 40      # pilot on claude-haiku-4-5
+python3 research/classify.py --compare       # model vs the regexes
+python3 research/classify.py --model claude-opus-5   # the pass you keep
+```
+
+Whole corpus costs $0.25–$2.45 depending on model, so choose on label quality,
+not price. Verdicts cache to `data/desync.jsonl` keyed by a content hash, which
+is what keeps the figures reproducible after the first run — `PLAN.md` bans a
+model from the *trigger* path for that reason, and while this is the labelling
+path the concern still applies. Every row records the model that produced it.
+
+**None of it is ground truth.** Spot-check a sample by hand before trusting a
+number that rests on it. The pilot returned `confidence: high` on 13 of 13
+desyncs, which is a calibration warning rather than a strength.
+
 ## Interception (`hooks/intercept.py`)
 
 A `UserPromptSubmit` hook. Rebuilds the pre-send state, evaluates the rules,
@@ -377,6 +406,7 @@ claude-resync/
     reduce.py            lossless corpus reduction + verification
     backtest.py          replay the rules over history, measure precision
     gaps.py              find desync signals no rule responds to
+    classify.py          ask a model whether each message was a real desync
 ```
 
 The split is not cosmetic. Anything under `hooks/` runs on every prompt or tool
