@@ -379,6 +379,27 @@ which happened on the first attempt. Delivered human messages already appear as
 "skip all attachments" guard throws away task notifications and makes every
 completed background task look unreported.
 
+**`isMeta: True` marks a user-role line the platform generated, not one you
+typed.** Skill bodies, tool-companion output and injected notices all arrive as
+`type: user` with `role: user` and arbitrary text — nothing in the text itself
+identifies them, and `_SYS_PREFIX` only catches the ones that open with an XML
+tag. They also carry `sourceToolUseID` and `turnCompanion`.
+
+Ignoring this cost more than it looks. In session 0825c6b6 a single `isMeta`
+line — the `claude-api` skill body — held **94,691 of the 96,984 characters**
+stored as "your messages": 97.6% of what the similarity rules compare against,
+re-tokenised on every prompt, in a cache file re-read and re-written every turn
+(103,887 bytes, rebuilt at 5,500 after the fix). Across the corpus 13 of 441
+"human-authored messages" were machine-generated, and they were generating
+fires: R06 lost 8, R08 lost 7, R05 lost 4, R11 lost 2 — and both of R06's
+"confirmed" hindsight labels turned out to be fires on injected documentation,
+taking it from 3% to 0%.
+
+`ingest_line` now drops them. Message text is also capped at
+`MSG_MAX_CHARS` (8000) and `queue_ops` at `MAX_QUEUE_OPS` (400), because
+nothing downstream reads past a few hundred characters (R01 compares 400, R07
+compares 600) and both lists otherwise grow for the life of a session.
+
 **Other `attachment.type` values seen:** `deferred_tools_delta`,
 `agent_listing_delta`, `mcp_instructions_delta`, `skill_listing`, `auto_mode`,
 `total_tokens_reminder`, `date_change`, `command_permissions` (carries

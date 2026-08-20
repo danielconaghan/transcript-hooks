@@ -457,7 +457,7 @@ class Resolver(object):
 # fix rendering
 # --------------------------------------------------------------------------
 
-TERMINAL_ROLES = ("", "0", "no", "off", "false")
+FALSY_ENV = ("", "0", "no", "off", "false")
 
 # The one place anything in this project leaves the machine. Sends the outgoing
 # message, the rule's concern and the reference list — never the transcript.
@@ -479,7 +479,7 @@ def api_enabled():
     """Set CLAUDE_RESYNC_API=0 to stop every outbound call without touching
     the catalogue."""
     return (os.environ.get("CLAUDE_RESYNC_API", "1").strip().lower()
-            not in TERMINAL_ROLES)
+            not in FALSY_ENV)
 
 
 def import_anthropic():
@@ -725,7 +725,6 @@ def run_hook(payload, dry_run=False):
         by_id = {r["id"]: r for r in catalogue["rules"]}
         fires = E.evaluate(state)
 
-        injections, records = [], []
         for f in fires:
             action = E.action_for(f.rule, catalogue)
             surfaced, deduped, suppressed, api = False, False, None, None
@@ -737,10 +736,13 @@ def run_hook(payload, dry_run=False):
                 if text:
                     injections.append(text)
                     surfaced = True
-            elif E.dedupes(f.rule, catalogue):
-                # One record per cause, whether or not it surfaces, so live
-                # counts stay comparable with the backtest's. `deduped` rows
-                # are kept rather than dropped — they are how a trigger that
+            elif action == "skip":
+                suppressed = "not-in-catalogue"
+            else:
+                # Every non-augment action dedupes (see rules_engine.dedupes),
+                # so: one record per cause whether or not it surfaces, keeping
+                # live counts comparable with the backtest's. `deduped` rows are
+                # kept rather than dropped — they are how a trigger that
                 # re-fires on a stale cause becomes visible at all.
                 if f.key in cache.seen:
                     deduped = True

@@ -531,6 +531,17 @@ _SYS_PREFIX = re.compile(
 _INTERRUPT = re.compile(r"^\[Request interrupted")
 
 
+# A typed message is essentially never this long; the pathological cases are
+# machine-generated. Nothing downstream reads beyond a few hundred characters
+# (R01 compares 400, R07 compares 600), so storing more is pure weight on a
+# file that is re-read and re-written on every prompt.
+MSG_MAX_CHARS = 8000
+
+# queue_ops accumulates for the whole session and every entry carries its full
+# content. Bounded for the same reason msgs is.
+MAX_QUEUE_OPS = 400
+
+
 def new_accumulator():
     return {"msgs": [], "queue_ops": [], "questions": [], "launches": {},
             "notified": {}, "api_errors": [], "denials": [], "pending_q": {}}
@@ -587,8 +598,11 @@ def ingest_line(acc, d):
         content = d.get("content")
         content = content if isinstance(content, str) else ""
         acc["queue_ops"].append({
-            "op": d.get("operation"), "at": when, "content": content,
+            "op": d.get("operation"), "at": when,
+            "content": content[:MSG_MAX_CHARS],
             "human": bool(content) and not _SYS_PREFIX.match(content)})
+        if len(acc["queue_ops"]) > MAX_QUEUE_OPS:
+            del acc["queue_ops"][:-MAX_QUEUE_OPS]
         return
 
     if t == "assistant":
@@ -607,6 +621,15 @@ def ingest_line(acc, d):
         return
 
     if t == "user":
+        # `isMeta` marks a user-role line the platform generated rather than
+        # one you typed: skill bodies, tool-companion output, injected notices.
+        # They arrive with role "user" and arbitrary text, so nothing in the
+        # text itself reliably identifies them. Measured in session 0825c6b6: a
+        # single isMeta line held 94,691 of the 96,984 characters stored as
+        # "your messages" — 97.6% of the corpus the similarity rules compare
+        # against, and a 95KB string re-tokenised on every prompt.
+        if d.get("isMeta"):
+            return
         msg = d.get("message") or {}
         c = msg.get("content")
         text = (_text_of(msg) or "").strip()
@@ -625,7 +648,7 @@ def ingest_line(acc, d):
             return
         if not text or _SYS_PREFIX.match(text) or _INTERRUPT.match(text):
             return
-        acc["msgs"].append({"at": when, "text": text})
+        acc["msgs"].append({"at": when, "text": text[:MSG_MAX_CHARS]})
 
 
 def state_from_accumulator(acc, prompt, at, session_id=None, cwd=None,
