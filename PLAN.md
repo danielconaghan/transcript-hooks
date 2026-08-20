@@ -250,6 +250,42 @@ happened next. Once the hook is live, every fire has a recorded consequence.
 
 ---
 
+## R01's precision is not 1.0 — open, and the most important thing here
+
+The first live fire of the phase-3 loop was a **false positive**, and it breaks
+the verification `rules.json` rests on.
+
+A **mid-turn interjection** — a message you send while the assistant is working
+— is delivered and acted on, but produces `enqueue` + `remove` +
+`queued_command` and **no `type: user` line at all**. R01's check is "no similar
+user message exists before or after the retraction", so it cannot see that
+delivery, and reports the message as withheld.
+
+Two candidate discriminators were tested and both failed:
+
+- **`queued_command` fields are byte-identical** between a confirmed delivery
+  and two claimed withholdings: `commandMode: 'prompt'`,
+  `origin: {'kind': 'human'}`. `source_uuid` appears in recent records of both
+  kinds, so it dates the schema, not the outcome.
+- **The enqueue→remove gap does not separate them.** Predicted bimodal (a
+  withdrawal is instant, a delivery is later); measured across 39 human removes
+  it is continuous — 3 at ≤1s, 2 at 1–2s, 10 at 2–5s, 20 at 5–30s, 4 beyond.
+  Obvious in hindsight: changing your mind can take five minutes.
+
+So `precision: 1.0` is an upper bound, not a measurement. The backtest confirms
+33/33 using the same lexical test the trigger uses, and that test is blind to
+this entire delivery path. Recorded in `rules.json` under R01's `known_limit`.
+
+**Untested idea worth trying next:** a withdrawal happens while the assistant is
+idle and waiting for input; a mid-turn interjection happens while it is *mid
+turn*. So check whether the `remove` timestamp falls inside an assistant turn
+(bracketed by assistant/tool lines) or in an idle gap. That is derivable from
+the transcript and would separate the two classes — if it holds.
+
+This is also the vindication of building the thing: the system found a real
+defect in its own highest-precision rule, on its first live ask, in a way no
+amount of replay against the same lexical test could have.
+
 ## Verified platform facts
 
 Established empirically with a throwaway probe (kept at

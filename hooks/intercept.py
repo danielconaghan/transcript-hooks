@@ -464,6 +464,12 @@ TERMINAL_ROLES = ("", "0", "no", "off", "false")
 # claude-opus-5 with effort "low": low effort is the latency lever, not
 # disabling thinking, which on Opus 5 can put a tool call into visible text.
 API_MODEL = "claude-opus-5"
+
+# `output_config.effort` is rejected by Haiku 4.5 and Sonnet 4.5 — sending it
+# there is a 400, which fails open to the template and looks like the model
+# being useless rather than the request being wrong. Measured: opus-5 5.5s,
+# sonnet-5 3.0s, haiku-4-5 1.6s for the same draft.
+NO_EFFORT_MODELS = ("claude-haiku-4-5", "claude-sonnet-4-5", "claude-haiku-3")
 API_TIMEOUT_S = 5.0          # hook ceiling is 30s, but this is added latency
                              # on a message you are waiting to send
 API_MAX_TOKENS = 400
@@ -474,6 +480,29 @@ def api_enabled():
     the catalogue."""
     return (os.environ.get("CLAUDE_RESYNC_API", "1").strip().lower()
             not in TERMINAL_ROLES)
+
+
+def import_anthropic():
+    """Return the anthropic module, or None.
+
+    Homebrew's python is PEP 668 externally-managed, so `pip install anthropic`
+    into it is refused outright. The SDK therefore lives in a venv beside the
+    runtime (`~/.claude-resync/.venv`) and this reaches into it, because the
+    hook itself runs whatever `python3` is on PATH.
+
+    The interpreter version is part of the path on purpose: a venv built
+    against 3.14 is not importable from 3.15, and silently importing a
+    mismatched build would be worse than reporting the SDK as missing. Upgrade
+    python and `--status` will say `sdk: MISSING` until the venv is rebuilt."""
+    site = os.path.join(HOME_DIR, ".venv", "lib",
+                        "python%d.%d" % sys.version_info[:2], "site-packages")
+    if os.path.isdir(site) and site not in sys.path:
+        sys.path.append(site)
+    try:
+        import anthropic
+        return anthropic
+    except Exception:
+        return None
 
 
 def load_env_file(path=None):
@@ -519,9 +548,8 @@ def draft_via_api(spec, fire, state):
     instruction = (spec or {}).get("instruction")
     if not instruction:
         return None, "no-instruction"
-    try:
-        import anthropic
-    except Exception:
+    anthropic = import_anthropic()
+    if anthropic is None:
         return None, "sdk-missing"
     load_env_file()
     situation = (
@@ -530,14 +558,19 @@ def draft_via_api(spec, fire, state):
         % (state.prompt[:2000], fire.why or "", fire.detail or "",
            state.cwd or "?"))
     try:
+        kwargs = {}
+        if not API_MODEL.startswith(NO_EFFORT_MODELS):
+            # Low effort is the latency lever. Disabling thinking is not: on
+            # Opus 5 that can put a tool call into visible text.
+            kwargs["output_config"] = {"effort": "low"}
         client = anthropic.Anthropic()
         resp = client.with_options(
             timeout=API_TIMEOUT_S, max_retries=0).messages.create(
                 model=API_MODEL,
                 max_tokens=API_MAX_TOKENS,
-                output_config={"effort": "low"},
                 system=instruction,
-                messages=[{"role": "user", "content": situation}])
+                messages=[{"role": "user", "content": situation}],
+                **kwargs)
         if resp.stop_reason == "refusal":
             return None, "refusal"
         text = " ".join(b.text for b in resp.content
@@ -948,11 +981,9 @@ def do_status():
     load_env_file()
     have_key = bool(os.environ.get("ANTHROPIC_API_KEY")
                     or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
-    try:
-        import anthropic  # noqa: F401
-        sdk = "installed"
-    except Exception:
-        sdk = "MISSING (pip install anthropic)"
+    mod = import_anthropic()
+    sdk = ("installed %s" % getattr(mod, "__version__", "?") if mod
+           else "MISSING — %s/.venv/bin/pip install anthropic" % HOME_DIR)
     print("api      : %s%s"
           % ("on" if api_enabled() else "off (CLAUDE_RESYNC_API=0)",
              ", model %s, %.0fs timeout" % (API_MODEL, API_TIMEOUT_S)

@@ -58,7 +58,8 @@
           "basis": "auto",
           "sessions": 9,
           "precision_labelled": 1.0
-        }
+        },
+        "precision_caveat": "backtest reports 1.0; one confirmed live false positive. See known_limit."
       },
       "evidence": [
         {
@@ -93,7 +94,7 @@
         }
       ],
       "verification": "`remove` was confirmed not to mean `sent`: matching all 37 human retractions against real user messages in both time directions gives 33 with no counterpart anywhere, 3 identical matches 46-147s EARLIER (queue cleanup following a send), and 1 re-sent 27 min later. Cleanup with nothing to clean up is not a thing, so the 33 stand.",
-      "known_limit": "Lexical matching cannot detect a semantic re-send. The a0c27fd2 case_ref draft scores 0.37 similarity and lands in `never sent`, yet its content did arrive 11 minutes later reworded. Read 33 as `withheld verbatim`, with an unknown subset arriving reworded.",
+      "known_limit": "Lexical matching cannot detect a semantic re-send. The a0c27fd2 case_ref draft scores 0.37 similarity and lands in `never sent`, yet its content did arrive 11 minutes later reworded. Read 33 as `withheld verbatim`, with an unknown subset arriving reworded. LIVE FALSE POSITIVE, 2026-08-20: a mid-turn interjection in session 0825c6b6 fired R01 despite being delivered and acted on. Such a message produces enqueue + remove + queued_command and NO `type: user` line, so the check 'no similar user message exists' cannot see the delivery. The queued_command fields are byte-identical to a genuine withdrawal (commandMode='prompt', origin={'kind':'human'}), and the enqueue->remove gap does not separate the cases (39 human removes: 3 at <=1s, 10 at 2-5s, 20 at 5-30s, 4 beyond). So precision 1.0 is NOT established — it is confirmed/fires under a check blind to this delivery path. Treat it as an upper bound until mid-turn deliveries can be identified.",
       "requires_fields": [
         "queue-operation.operation",
         "queue-operation.content",
