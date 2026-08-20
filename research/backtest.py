@@ -51,6 +51,7 @@ import argparse
 import collections
 import difflib
 import glob
+import hashlib
 import json
 import os
 import re
@@ -82,6 +83,39 @@ REFINED = os.path.join(resync_home(), "refined")
 RULES = os.path.join(REPO, "rules.json")
 # Labels are written by the live interceptor, so they live with the runtime.
 LABELS = os.path.join(resync_home(), "data", "labels.jsonl")
+# Retrospective markers from research/classify.py — messages a model judged to
+# be the point where a desync surfaced.
+DESYNC = os.path.join(resync_home(), "data", "desync.jsonl")
+
+
+def msg_key(session_id, text):
+    """Stable identity for a message. Defined here rather than in classify.py so
+    both sides hash identically — the same reason ingestion is shared."""
+    return hashlib.sha1(
+        ("%s|%s" % (session_id, text)).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def load_markers():
+    """{msg_key: row} for messages a classifier judged to be a desync.
+
+    Empty when classify.py has not run, in which case hindsight labelling falls
+    back to RE_CORRECTION — measured at roughly 46% recall, which is why the
+    markers are preferred whenever they exist."""
+    out = {}
+    if not os.path.exists(DESYNC):
+        return out
+    with open(DESYNC, errors="replace") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("key"):
+                out[d["key"]] = d          # last write wins
+    return {k: v for k, v in out.items() if v.get("desync")}
+
+
+MARKERS = None      # lazily loaded once, so replay() does not re-read per session
 
 SYS_PREFIX = re.compile(
     r"^\s*<(task-notification|bash-|local-command|system-reminder|command-name)")
@@ -165,10 +199,18 @@ def replay(sid, rows):
         # against state EXCLUDING it, which is what the hook would have seen.
         newest = acc["msgs"][-1]
         idx += 1
+        global MARKERS
+        if MARKERS is None:
+            MARKERS = load_markers()
+        text = newest.get("text") or ""
+        mk = MARKERS.get(msg_key(sid, text))
         msg = {"id": "%s#%04d" % (sid[:8], idx), "at": ts(newest.get("at")),
-               "text": newest.get("text") or "",
-               "toks": E.tokens(newest.get("text") or ""),
-               "queued": bool(newest.get("queued"))}
+               "text": text,
+               "toks": E.tokens(text),
+               "queued": bool(newest.get("queued")),
+               # A retrospective marker: this is where a desync surfaced.
+               "marker": bool(mk),
+               "marker_kind": (mk or {}).get("kind")}
         held = acc["msgs"].pop()
         state = E.state_from_accumulator(
             acc, prompt=msg["text"], at=msg["at"], session_id=sid,
@@ -209,14 +251,29 @@ def load_fixture():
 def later_correction(msgs, after, subject):
     """Did the user later correct this subject?
 
+    A later message counts as a correction if a classifier marked it a
+    retrospective marker (`research/classify.py`), falling back to
+    RE_CORRECTION when no markers have been produced yet. The fallback is what
+    this used to do exclusively, and it was measured on a 40-message pilot at
+    roughly 46% recall — it missed over half of real desyncs, and the ones it
+    missed had no correction vocabulary at all ("open crm-launch is not serving
+    and not responding with data"). A label that misses half its subject makes
+    every hindsight precision figure a floor of a floor.
+
     Requires two shared vocabulary items with the triggering *reference*, not
-    with the whole message. That guard is load-bearing: a long brief overlaps
-    almost any later message, which produced four bogus confirmations before
-    it existed. Conservative by design, so it under-counts."""
+    with the whole message. That guard is load-bearing whichever detector is
+    used: a long brief overlaps almost any later message, which produced four
+    bogus confirmations before it existed."""
+    global MARKERS
+    if MARKERS is None:
+        MARKERS = load_markers()
     for m in msgs:
         if not m["at"] or not after or m["at"] <= after:
             continue
-        if not RE_CORRECTION.search(m["text"]):
+        if MARKERS:
+            if not m.get("marker"):
+                continue
+        elif not RE_CORRECTION.search(m["text"]):
             continue
         overlap = subject & m["toks"]
         if len(overlap) >= 2:

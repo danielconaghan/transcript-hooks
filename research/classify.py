@@ -149,11 +149,10 @@ SCHEMA = {
 }
 
 
-def msg_key(session_id, text):
-    """Stable identity for a message, so a verdict survives a re-run and a
-    re-reduction. Content-hashed for the same reason fire keys are."""
-    return hashlib.sha1(
-        ("%s|%s" % (session_id, text)).encode("utf-8", "replace")).hexdigest()[:16]
+# Defined in backtest so both sides hash identically — a verdict written here
+# has to be findable by the replay that consumes it, and two copies of a hash
+# function is exactly how that quietly stops being true.
+msg_key = B.msg_key
 
 
 def collect(limit=None):

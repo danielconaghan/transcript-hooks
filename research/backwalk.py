@@ -36,10 +36,19 @@ the fixes had not landed was in the assistant's own tool output. No preventative
 action on the INPUT side can catch that, which is the strongest argument in the
 corpus for a PostToolUse-side check of assertion against tool result.
 
-Where rules did fire beforehand they were mostly the content-blind ones — R03
-fires on a session's first message whatever it says, R05/R06/R08 on any
-reference mention. The one genuine signal was R04 (an unanswered decision)
-persisting across T-1, T-2 and T-3 before two markers in one session.
+Where rules did fire beforehand they were mostly content-blind — R03 fires on a
+session's first message whatever it says, R05 on any endpoint mention. (R06 and
+R08 counted here too until the resolver was made to gate their fire.) The one
+genuine signal was R04 — an unanswered decision persisting across T-1, T-2 and
+T-3 before two markers in one session.
+
+Every candidate signal then died on its base rate. Against all 448 messages:
+`denial` 54.8% before a marker vs 72.3% overall (0.76x), `open-question` 28.6%
+vs 32.8% (0.87x), `queue-remove` 19.0% vs 31.9% (0.60x). All BELOW 1.0 — less
+common before a marker than in general. `denial` looked compelling at 23 of 42
+until the base rate showed it is simply present nearly everywhere. Nothing in
+the current PreSendState predicts a desync, so a new preventative action cannot
+be built from the state as it stands.
 
 Usage:
     python3 backwalk.py                  # every marker, 3 messages back
@@ -66,7 +75,9 @@ MARKERS = os.path.join(B.resync_home(), "data", "desync.jsonl")
 
 # Fires on nearly everything, so its presence before a marker is not evidence.
 # Kept in step with gaps.CONTENT_BLIND.
-CONTENT_BLIND = {"R03", "R05", "R06", "R08"}
+# R06/R08 dropped: the resolver now gates their fire, so they are
+# no longer content-blind. Kept in step with gaps.CONTENT_BLIND.
+CONTENT_BLIND = {"R03", "R05"}
 ALWAYS = {"R13"}
 
 

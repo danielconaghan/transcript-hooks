@@ -21,11 +21,17 @@ Two corrections make the number honest, and without them it flatters badly:
   * **R13 is excluded.** It fires on every message by design, so counting it as
     coverage would report 100% coverage of everything.
   * **Content-blind fires are reported separately.** R03 fires on the first
-    message of a session whatever it says. R05, R06 and R08 fire on any
-    message mentioning an endpoint, path or URL — a correction that happens to
-    name a file is not a correction the catalogue understood. Measured on the
-    50-session corpus, 27 of 42 "covered" corrections were of this kind, taking
-    real coverage from 63% to roughly 24%.
+    message of a session whatever it says; R05 on any message naming an
+    endpoint. A correction that happens to name an endpoint is not a correction
+    the catalogue understood. Measured before R06/R08 were fixed, 27 of 42
+    "covered" corrections were content-blind, taking real coverage from an
+    apparent 63% to roughly 24%.
+
+    R06 and R08 used to belong here too. They now require the resolver to
+    confirm a missing reference or a dead local URL before firing, so a fire
+    from either one is about the message. That change removes 111 content-blind
+    fires from the corpus and means neither has historical fires any more — the
+    backtest passes resolver=None, so they are measurable only from live use.
 
 What is automatic and what is not
 ---------------------------------
@@ -66,9 +72,10 @@ import backtest as B       # noqa: E402
 CONTENT_BLIND = {
     "R03": "fires on the first message of a session, whatever it says",
     "R05": "fires on any message naming an endpoint",
-    "R06": "fires on any message naming a path or repo",
-    "R08": "fires on any message containing a URL",
 }
+# R06 and R08 were here until the resolver was made to gate their fire rather
+# than only word it. They now require a confirmed missing reference or a dead
+# local URL, so a fire from them IS about the message.
 ALWAYS = {"R13"}          # fires on every message by design
 
 SIGNALS = {

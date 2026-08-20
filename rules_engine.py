@@ -283,24 +283,36 @@ def r06_unresolved_reference(state):
                       + RE_REPO.findall(state.prompt)))
     if not refs:
         return []
-    # With a resolver, split resolvable from missing; without one, report the
-    # references and let the caller decide. Never guess that a path is absent
-    # just because we could not look.
+    # The concern is "this reference does not resolve", so the resolver decides
+    # whether to FIRE, not merely how to word it.
+    #
+    # It used to fire on any message containing a path and consult the resolver
+    # only for the `why`. That made it a path-mention detector: a reference that
+    # existed and resolved perfectly still fired, 59 times across the corpus,
+    # and its measured precision described nothing. It also meant the backtest —
+    # which passes resolver=None because the world of that day is gone — could
+    # never evaluate the check at all.
+    #
+    # Consequence, accepted deliberately: with no resolver there is no fire, so
+    # R06 has no historical fires and is measurable only from live use. Nothing
+    # is lost, because the historical fires were not measuring the rule.
+    if state.resolver is None:
+        return []
     missing = []
-    if state.resolver is not None:
-        for r in refs:
-            try:
-                if not state.resolver.exists(r):
-                    missing.append(r)
-            except Exception:
-                pass
-    subj = set()
     for r in refs:
+        try:
+            if not state.resolver.exists(r):
+                missing.append(r)
+        except Exception:
+            pass
+    if not missing:
+        return []
+    subj = set()
+    for r in missing:
         subj |= tokens(r)
-    why = ("reference(s) do not resolve: %s" % ", ".join(missing)) if missing \
-        else "message cites reference(s) that may not contain what is claimed"
-    return [Fire("R06", "refs:" + _sha("|".join(refs)), why,
-                 detail=", ".join(refs)[:200], subject=subj)]
+    return [Fire("R06", "refs:" + _sha("|".join(missing)),
+                 "reference(s) do not resolve: %s" % ", ".join(missing),
+                 detail=", ".join(missing)[:200], subject=subj)]
 
 
 def r07_near_duplicate(state):
@@ -333,18 +345,25 @@ def r08_unreachable_url(state):
     urls = sorted(set(RE_URL.findall(state.prompt)))
     if not urls:
         return []
+    # Same change as R06: the resolver decides whether to fire. Previously any
+    # message containing a URL fired, 52 times across the corpus, and for a
+    # public host the injection could only ever say "reachability unchecked" —
+    # a guaranteed fire carrying no information. Only a local dev address that
+    # is genuinely not listening is worth saying anything about.
+    if state.resolver is None:
+        return []
     dead = []
-    if state.resolver is not None:
-        for u in urls:
-            try:
-                if state.resolver.url_serves(u) is False:
-                    dead.append(u)
-            except Exception:
-                pass
-    why = ("url(s) not serving: %s" % ", ".join(dead)) if dead \
-        else "message contains url(s); reachability unchecked"
-    return [Fire("R08", "urls:" + _sha("|".join(urls)), why,
-                 detail=", ".join(urls)[:200], subject=tokens(" ".join(urls)))]
+    for u in urls:
+        try:
+            if state.resolver.url_serves(u) is False:
+                dead.append(u)
+        except Exception:
+            pass
+    if not dead:
+        return []
+    return [Fire("R08", "urls:" + _sha("|".join(dead)),
+                 "url(s) not serving: %s" % ", ".join(dead),
+                 detail=", ".join(dead)[:200], subject=tokens(" ".join(dead)))]
 
 
 def r09_unverified_premise(state):
