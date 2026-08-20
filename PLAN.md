@@ -325,6 +325,56 @@ candidate: a delivery's `remove` should coincide with the turn yielding — next
 an `AskUserQuestion`, a permission prompt, or a tool-call boundary — where a
 genuine take-back should not. Until then the rule stays suspended.
 
+## Precision figures cannot all drive behaviour — and mostly do not measure the rule
+
+Read the runtime and the backtest together and the routing apparatus turns out to
+rest on numbers that do not mean what their name says.
+
+`backtest.py` records HOW each fire was judged, and only one of those ways can
+support a behavioural decision:
+
+| basis | what it is | usable? |
+| --- | --- | --- |
+| `auto` | an independent fact in the data | yes |
+| `auto-proxy` | *"a weak stand-in for the real question, flagged as such"* | **no** |
+| `hindsight` | *"conservative by design, so it under-counts"* — a miss returns UNLABELLED, never refuted | **no** |
+| `tautological` / `manual` / `none` | no automatic label exists | n/a |
+
+Two concrete consequences, both now fixed in `action_for`:
+
+- **R04 was promoted to `apply`** — inject the fix, ask nothing — on `auto-proxy`
+  evidence whose own label text reads *"session continued 3 message(s) over 12
+  min without the answer (proxy, not topic resolution)"*. Almost every session
+  continues, so 0.857 measured sessions being normal. R04's catalogue action is
+  `block`, the most aggressive verb in the vocabulary. It is now `ask`.
+- **Demoting on a hindsight floor inverts the metric.** R06 read 0% on 57 fires
+  with **zero refutations**. That is "we could not prove it right", not "it was
+  wrong 57 times". `action_for` now demotes only on actual counter-evidence
+  (`refuted > 0`); an unproven rule asks, which is what `ask` is for.
+
+`TRUSTED_BASIS` gates both the ceiling and the floor. A hand label always counts
+— it is the one judgement made by someone who knew what the message meant.
+
+### R06 and R08 were never measured as the rules that run
+
+`replay()` passes `resolver=None` — *"the world of that day is gone"*, honestly
+commented. But `r06_unresolved_reference` returns a fire whenever the message
+contains **any** path, and only consults the resolver to word the `why`:
+
+```
+backtest  (resolver=None) -> fires=1   "cites reference(s) that may not contain what is claimed"
+live      (real resolver) -> fires=1   "reference(s) do not resolve: ./deploy.sh"
+live, reference exists and resolves -> fires=1     <-- still fires
+```
+
+So R06's 57 historical fires mean *"the message mentioned a path"*, not *"the
+message mentioned a missing path"*. Its precision was never measuring the check
+at all. R08 has the same shape for URLs. This is why R06 is noisy: in the
+backtest there is no check, and live the check does not gate the fire.
+
+Fixing R06 properly means making the resolver decide **whether to fire**, not
+just how to phrase it. Until then its numbers describe a path-mention detector.
+
 ## Verified platform facts
 
 Established empirically with a throwaway probe (kept at

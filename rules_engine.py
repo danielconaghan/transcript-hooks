@@ -458,6 +458,29 @@ PRECISION_CEILING = 0.8
 # how it acquires the labels that measure it.
 PRECISION_FLOOR = 0.30
 
+# Which labelling bases may drive a behaviour change at all.
+#
+# This gate exists because precision is not one kind of number. backtest.py
+# records HOW each fire was judged, and most of those ways cannot support a
+# routing decision:
+#
+#   auto          an independent fact in the data. Trustworthy.
+#   auto-proxy    "a weak stand-in for the real question, flagged as such" —
+#                 R04's label is literally "session continued N messages
+#                 without the answer (proxy, not topic resolution)". Almost
+#                 every session continues, so 86% measures sessions being
+#                 normal, not the rule being right.
+#   hindsight     "conservative by design, so it under-counts" — a miss returns
+#                 UNLABELLED, never refuted. R06 reads 0% on 57 fires with ZERO
+#                 refutations: that is "we could not prove it right", not "it
+#                 was wrong 57 times". Demoting on it inverts the metric.
+#   tautological / manual / none
+#                 no automatic label exists.
+#
+# A hand label is always trusted: it is the one judgement made by someone who
+# knew what the message meant.
+TRUSTED_BASIS = ("auto",)
+
 
 def action_for(rule_id, catalogue, precision_threshold=PRECISION_CEILING,
                precision_floor=PRECISION_FLOOR):
@@ -482,11 +505,18 @@ def action_for(rule_id, catalogue, precision_threshold=PRECISION_CEILING,
     act = rule.get("action")
     if act in ("augment", "annotate", "resend"):
         return "augment"
-    prec = (rule.get("metrics") or {}).get("precision")
-    if prec is not None:
+    metrics = rule.get("metrics") or {}
+    bt = metrics.get("backtest") or {}
+    prec = metrics.get("precision")
+    trusted = (bt.get("basis") in TRUSTED_BASIS
+               or (bt.get("hand_labelled") or 0) > 0)
+    if prec is not None and trusted:
         if prec >= precision_threshold:
             return "apply"
-        if prec < precision_floor:
+        # Demote only on actual counter-evidence. A rule with no refutations has
+        # nothing said against it; a low floor there means "unproven", and
+        # unproven is what `ask` is for.
+        if prec < precision_floor and (bt.get("refuted") or 0) > 0:
             return "log"
     return "ask"
 
