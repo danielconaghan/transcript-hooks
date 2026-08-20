@@ -1,0 +1,730 @@
+{
+  "schema_version": 1,
+  "purpose": "Candidate interception rules for a pre-send service that augments, questions, or blocks a user message before it reaches the assistant. Each rule is justified by instances measured in the transcript corpus, so the set can be ranked by expected value rather than intuition.",
+  "provenance": {
+    "derived_from": "~/.claude-transcripts/refined (lossless reduction of the capture corpus)",
+    "generated": "2026-08-20",
+    "sessions_total": 51,
+    "sessions_with_content": 48,
+    "user_authored_messages": 423,
+    "note": "Counts come from structured transcript fields, not from reading sessions: toolDenialKind, promptSource, userFeedback, interruptedMessageId, apiErrorStatus, queue-operation records, tool_input scalars, and events.jsonl payloads. All are corpus-wide unless a rule says otherwise.",
+    "caveat_precision": "Precision is computed by backtest.py replaying each trigger over the historical corpus. `basis` states how each fire was judged: `auto` labels are facts in the data; `hindsight` labels come from the user's own later correction and UNDER-count, so those figures are floors; `none` means not labellable and precision stays null. No figure here comes from hand-labelling yet.",
+    "caveat_cost": "`measured_cost` is wall-clock desync duration observed in specific instances, not an average. It is a floor, not an estimate.",
+    "backtest_generated": "2026-08-20",
+    "backtest_engine": "rules_engine.py — the same triggers intercept.py runs, so these figures describe the deployed code rather than a reimplementation.",
+    "fix_templates": "Each rule's `fix` is the text injected via additionalContext when it fires. A null means the rule is counted but injects nothing. A {\"via\":\"api\"} means the text needs drafting by a model at fire time (phase 3). Templates live here rather than in intercept.py so this file stays the single record of what each rule does."
+  },
+  "action_types": {
+    "augment": "Silently attach facts to the outgoing message. No user interruption. Safe at high fire rates.",
+    "ask": "Put a question to the user before sending. Costly attention. Only justified at low fire rate and high precision.",
+    "block": "Refuse to send until a prior condition is satisfied.",
+    "resend": "Re-deliver a message the platform lost. No user interaction.",
+    "annotate": "Record provenance for downstream rules. No behaviour change."
+  },
+  "budget_finding": {
+    "messages_firing_any_trigger": 90,
+    "fire_rate_pct": 21.0,
+    "asks_per_100_messages_if_built_as_specced": 1.4,
+    "note": "The frequent triggers are all reference-resolution, which augments silently. Only the rare triggers need a question. Preserve that split deliberately: a service that asks on 20% of messages will be disabled within a day."
+  },
+  "rules": [
+    {
+      "id": "R01",
+      "name": "withheld-draft",
+      "summary": "The user typed a message, queued it, and withdrew it without ever sending the information.",
+      "trigger": {
+        "where": "queue state",
+        "match": "queue-operation `remove` carrying human-authored content of >20 chars"
+      },
+      "check": {
+        "against": "the rest of the session",
+        "method": "no similar user message exists before or after the retraction"
+      },
+      "action": "ask",
+      "prompt_to_user": "You drafted this and removed it. Send it as context?",
+      "rationale": "This is desync with a written confession: the user formed the correct belief in words and the assistant never received it. Content observed includes three unreported CORS errors, a browser choice that would have explained extension failures, a company-alias correction, a legacy-scope correction, and one instance of the user noticing the assistant was off-track and swallowing it.",
+      "metrics": {
+        "instances": 33,
+        "sessions": 6,
+        "human_enqueues": 52,
+        "retraction_rate_pct": 63.0,
+        "precision": 1.0,
+        "measured_cost": "11 min (a0c27fd2 case_ref, arrived reworded later); unmeasured but non-zero for the rest",
+        "backtest": {
+          "fires": 31,
+          "confirmed": 31,
+          "refuted": 0,
+          "unknown": 0,
+          "basis": "auto",
+          "sessions": 9,
+          "precision_labelled": 1.0
+        }
+      },
+      "evidence": [
+        {
+          "session": "a0c27fd2",
+          "at": "18:58:59",
+          "draft": "ClientRef is being replaced with case_ref in the bff so any call to client ref is really case ref",
+          "outcome": "same information sent 11 min later in different words"
+        },
+        {
+          "session": "1c24b7b8",
+          "at": "18:32:54",
+          "draft": "getting cors error on https://idp.local.oxfordrisk.xyz/login",
+          "outcome": "never sent"
+        },
+        {
+          "session": "1c24b7b8",
+          "at": "17:55:02",
+          "draft": "fyi I installed the extension in opera, as we don't trust chrome",
+          "outcome": "never sent; browser-tool failures were debugged without it"
+        },
+        {
+          "session": "1c24b7b8",
+          "at": "18:41:26",
+          "draft": "is company dev-adviser i had it set as test",
+          "outcome": "never sent"
+        },
+        {
+          "session": "025d6b58",
+          "at": "11:43:03",
+          "draft": "Not sure why you have gone to such trouble I was expecting after repo change to spin down dev-env and spin up",
+          "outcome": "never sent — a desync the user noticed and did not report"
+        }
+      ],
+      "verification": "`remove` was confirmed not to mean `sent`: matching all 37 human retractions against real user messages in both time directions gives 33 with no counterpart anywhere, 3 identical matches 46-147s EARLIER (queue cleanup following a send), and 1 re-sent 27 min later. Cleanup with nothing to clean up is not a thing, so the 33 stand.",
+      "known_limit": "Lexical matching cannot detect a semantic re-send. The a0c27fd2 case_ref draft scores 0.37 similarity and lands in `never sent`, yet its content did arrive 11 minutes later reworded. Read 33 as `withheld verbatim`, with an unknown subset arriving reworded.",
+      "requires_fields": [
+        "queue-operation.operation",
+        "queue-operation.content",
+        "user message text"
+      ],
+      "confidence": "high",
+      "fix": "You wrote and withdrew a draft that was never sent: \"{detail}\". Ask whether it should be treated as context before acting."
+    },
+    {
+      "id": "R02",
+      "name": "stale-background-task-state",
+      "summary": "The assistant believes background work is running that has finished or died, because the completion notification never arrived.",
+      "trigger": {
+        "where": "outgoing user message OR every message while tasks are pending",
+        "match": "any message sent while a background task is registered"
+      },
+      "check": {
+        "against": "events.jsonl payload background_tasks[]",
+        "method": "read live id/status/description"
+      },
+      "action": "augment",
+      "prompt_to_user": null,
+      "rationale": "74% of background launches never notified. The assistant then reports progress it cannot see, the user disbelieves it, and both wait. Attaching live task status to every message gives the assistant ground truth it otherwise has to infer from log mtimes. The same data lets the service answer 'is it stuck or working?' directly without forwarding the message at all.",
+      "metrics": {
+        "instances": 37,
+        "of_total_launches": 50,
+        "miss_rate_pct": 74.0,
+        "sessions": 11,
+        "precision": null,
+        "measured_cost": "~30 min across three user prompts in 1c24b7b8 (12:13, 12:21, 12:33), plus one false progress report at 12:14",
+        "backtest": {
+          "fires": 17,
+          "confirmed": 0,
+          "refuted": 0,
+          "unknown": 17,
+          "basis": "tautological",
+          "sessions": 3,
+          "precision_labelled": null
+        }
+      },
+      "evidence": [
+        {
+          "session": "1c24b7b8",
+          "at": "12:03:28",
+          "detail": "spin-waiter launched, never notified; assistant ended its turn on it; Docker Desktop died; user asked 'have you stopped running?' 10 min later"
+        },
+        {
+          "session": "1c24b7b8",
+          "at": "12:14:02",
+          "detail": "assistant asserted 'still running, log ticking' from a 3.5-minute-stale log and one surviving process"
+        }
+      ],
+      "requires_fields": [
+        "events.payload.background_tasks[].status",
+        "tool_input_scalars.run_in_background",
+        "task-notification tool-use-id"
+      ],
+      "confidence": "high",
+      "fix": "Background task status check: {detail} launched with no completion notification. Treat their state as unknown — verify with a liveness probe (is output still growing?) before reporting progress on them, and report a stall as a stall rather than as work in progress."
+    },
+    {
+      "id": "R03",
+      "name": "permission-blocked-operation",
+      "summary": "The assistant repeatedly attempts operations the permission layer will refuse, burning turns discovering the boundary.",
+      "trigger": {
+        "where": "session start and outgoing message",
+        "match": "always (context injection)"
+      },
+      "check": {
+        "against": "the active permission ruleset",
+        "method": "enumerate blocked command classes for this project"
+      },
+      "action": "augment",
+      "prompt_to_user": null,
+      "rationale": "The single most widespread friction signal in the corpus, and it is not disagreement — it is the assistant failing to know what it may do. Observed behaviour is simplify-and-retry against the same rule: three blocked attempts in 13 seconds, twice in one session, on the cleanup that had just broken the user's app.",
+      "metrics": {
+        "instances": 79,
+        "breakdown": {
+          "permission-rule": 64,
+          "automode-blocked": 15
+        },
+        "sessions": 24,
+        "precision": null,
+        "measured_cost": "unmeasured; observed as 3 wasted tool calls per occurrence and one unfixable stale-build error in a0c27fd2 at 20:56",
+        "backtest": {
+          "fires": 47,
+          "confirmed": 0,
+          "refuted": 0,
+          "unknown": 47,
+          "basis": "tautological",
+          "sessions": 47,
+          "precision_labelled": null
+        }
+      },
+      "evidence": [
+        {
+          "session": "a0c27fd2",
+          "at": "20:55:58 / 20:56:05 / 20:56:11",
+          "detail": "three blocked `rm -rf .next` variants in 13s; the fix the user was waiting for"
+        },
+        {
+          "session": "a0c27fd2",
+          "at": "09:58:19 / 09:58:37 / 09:58:42",
+          "detail": "three blocked greps in 23s, each simpler than the last"
+        }
+      ],
+      "requires_fields": [
+        "toolDenialKind",
+        "tool_use.input"
+      ],
+      "confidence": "high",
+      "fix": "Some operations are blocked by permission rules in this project. If a command is refused, adapt rather than retrying a simplified version of the same thing — repeated blocked attempts cost turns and change nothing. Ask for the operation to be run manually if it is required."
+    },
+    {
+      "id": "R04",
+      "name": "unanswered-question",
+      "summary": "The assistant asked a decision question that was dismissed or deflected, and then proceeded on an assumption.",
+      "trigger": {
+        "where": "outgoing user message",
+        "match": "an AskUserQuestion in this session was dismissed, or answered with `clarify`, and no answer followed"
+      },
+      "check": {
+        "against": "session question ledger",
+        "method": "track outstanding forks until explicitly answered or waived"
+      },
+      "action": "block",
+      "prompt_to_user": "There are N unanswered decisions from earlier. Answer them, or confirm the assistant should proceed on its stated assumption.",
+      "rationale": "7 of 24 questions got no answer. In the one case traced in detail, three of four unanswered forks were later resolved exactly as the assistant had recommended — hours later, after the wrong thing had been built in between. This is the highest-cost rule in the catalogue.",
+      "metrics": {
+        "instances": 7,
+        "of_total_questions": 24,
+        "breakdown": {
+          "answered": 17,
+          "clarify_no_answer": 5,
+          "dismissed": 2
+        },
+        "sessions": 13,
+        "precision": 0.857,
+        "measured_cost": "5h47m (a0c27fd2 case-scoped vs client-scoped); 5h (copy-link host); 3h (question source). Contrast: the one question that was answered took under a minute and never recurred.",
+        "backtest": {
+          "fires": 7,
+          "confirmed": 6,
+          "refuted": 1,
+          "unknown": 0,
+          "basis": "auto-proxy",
+          "sessions": 6,
+          "precision_labelled": 0.857
+        }
+      },
+      "evidence": [
+        {
+          "session": "a0c27fd2",
+          "at": "13:23:03",
+          "detail": "4 forks raised 9 minutes in, dismissed as user-rejected; 3 later resolved as recommended at 16:18, 18:08 and 19:10"
+        },
+        {
+          "session": "7de3007d",
+          "at": "15:04:07",
+          "detail": "user chose `clarify` on 'Where should the org->crm queue routing be fixed?'; userFeedback records '(No answer provided)'"
+        }
+      ],
+      "requires_fields": [
+        "tool_use.name == AskUserQuestion",
+        "toolDenialKind",
+        "userFeedback"
+      ],
+      "confidence": "medium-high",
+      "notes": "The three outcomes (answered / dismissed / clarify) are distinct and must not be collapsed. `clarify` is a request for a better question, not a refusal.",
+      "fix": "There are unanswered decision questions from earlier in this session ({detail}). Resolve them before acting on this message, or state explicitly which assumption you are proceeding on and why."
+    },
+    {
+      "id": "R05",
+      "name": "stale-api-surface",
+      "summary": "The message names an endpoint or route family that has been deprecated, renamed, or migrated.",
+      "trigger": {
+        "where": "outgoing user message",
+        "match": "contains an API path such as /clients/{ref}, /cases/, /oauth, /instructions"
+      },
+      "check": {
+        "against": "the current API repo or OpenAPI spec",
+        "method": "resolve the path; flag deprecation or migration notes"
+      },
+      "action": "augment",
+      "prompt_to_user": null,
+      "rationale": "Highest single measured cost in the corpus. The brief specified client_ref throughout while the BFF had already moved to case-scoped paths; the assistant flagged the discrepancy at minute 9 and was overruled by silence.",
+      "metrics": {
+        "instances_triggering": 32,
+        "fire_rate_pct": 7.5,
+        "sessions": null,
+        "precision": 0.031,
+        "measured_cost": "5h47m in a0c27fd2, still unresolved at session end (route directory remained app/clients/[clientRef]/)",
+        "backtest": {
+          "fires": 32,
+          "confirmed": 1,
+          "refuted": 0,
+          "unknown": 31,
+          "basis": "hindsight",
+          "sessions": 13,
+          "precision_labelled": 1.0
+        }
+      },
+      "evidence": [
+        {
+          "session": "a0c27fd2",
+          "at": "13:14:44",
+          "detail": "brief specifies client_ref throughout"
+        },
+        {
+          "session": "a0c27fd2",
+          "at": "19:10:03",
+          "detail": "user: 'there are no /client/ref endpoints, everything should be using case ref'"
+        }
+      ],
+      "requires_fields": [
+        "user message text",
+        "project API spec"
+      ],
+      "confidence": "medium",
+      "notes": "Frequent trigger, cheap check, silent action — so a low precision is tolerable here in a way it would not be for an `ask` rule.",
+      "fix": "The message names API path(s): {detail}. These may have been deprecated, renamed or migrated. Verify them against the current API surface before building on them, rather than assuming the shape named here is still current."
+    },
+    {
+      "id": "R06",
+      "name": "unresolved-reference",
+      "summary": "The message cites a repo, directory, or file as the authority for a pattern it does not contain.",
+      "trigger": {
+        "where": "outgoing user message",
+        "match": "contains a filesystem path or github repo reference"
+      },
+      "check": {
+        "against": "the filesystem and the repo contents",
+        "method": "resolve the reference; grep it for the thing it is cited for; name a repo that does contain it"
+      },
+      "action": "ask",
+      "prompt_to_user": "You cite X for Y, but X does not contain Y. Z does. Use Z?",
+      "rationale": "A brief that makes named repos authoritative and names the wrong ones is the most expensive kind of wrong, because the assistant is instructed to defer to them. Two of three named references were the wrong ones in a0c27fd2; the correct repo was supplied 18 minutes in and promoted to 'the new basis' 7 minutes after that.",
+      "metrics": {
+        "instances_triggering": 42,
+        "fire_rate_pct": 9.9,
+        "breakdown": {
+          "filesystem_path": 32,
+          "github_repo": 10
+        },
+        "sessions": null,
+        "precision": 0.038,
+        "measured_cost": "~1h in a0c27fd2; unmeasured in 7de3007d ('this is no summary repos, there is github.com/OxfordRisk/client-summary')",
+        "backtest": {
+          "fires": 52,
+          "confirmed": 2,
+          "refuted": 0,
+          "unknown": 50,
+          "basis": "hindsight",
+          "sessions": 28,
+          "precision_labelled": 1.0
+        }
+      },
+      "evidence": [
+        {
+          "session": "a0c27fd2",
+          "at": "13:14:44",
+          "detail": "brief: 'Read them properly... the repo wins' naming fpa-persona-mfe (static export, zero auth code) and simple-suitability (Vite, password grant, static Questions.json)"
+        },
+        {
+          "session": "7de3007d",
+          "at": "07:xx",
+          "detail": "user corrected the repo the assistant had been told to use"
+        }
+      ],
+      "requires_fields": [
+        "user message text",
+        "filesystem",
+        "repo contents"
+      ],
+      "confidence": "medium",
+      "notes": "Split by outcome: unresolvable reference -> ask; resolvable but lacking the cited pattern -> augment with the repo that has it. Only the first deserves an interruption.",
+      "fix": "The message cites reference(s): {detail}. {why}. Confirm the reference actually contains the pattern it is cited for before following it."
+    },
+    {
+      "id": "R07",
+      "name": "near-duplicate-resend",
+      "summary": "A near-identical message is sent within seconds of the previous one, so the assistant receives two versions and must guess which governs.",
+      "trigger": {
+        "where": "outgoing user message",
+        "match": ">=85% similarity to a message sent <120s ago"
+      },
+      "check": {
+        "against": "the previous message",
+        "method": "diff them and surface what changed"
+      },
+      "action": "ask",
+      "prompt_to_user": "This looks like a revision of your last message. Replace it, or send as an addition?",
+      "rationale": "Not merely a repeat: the assistant received two contradictory instructions 13 seconds apart and had to choose. This is a desync the interface manufactures rather than one the user creates.",
+      "metrics": {
+        "instances": 8,
+        "sessions": 4,
+        "precision": 0.333,
+        "measured_cost": "contradictory instructions resident in context; in a0c27fd2 one said an env var 'should be used' and its successor 'shouldnt be used'",
+        "backtest": {
+          "fires": 6,
+          "confirmed": 2,
+          "refuted": 0,
+          "unknown": 4,
+          "basis": "auto",
+          "sessions": 3,
+          "precision_labelled": 1.0
+        }
+      },
+      "evidence": [
+        {
+          "session": "a0c27fd2",
+          "at": "08:55:09 / 08:55:22",
+          "detail": "'...which should be used' then '...which shouldnt be used', 13s apart"
+        },
+        {
+          "session": "a0c27fd2",
+          "at": "15:17:41 / 15:18:41",
+          "detail": "identical requirement re-sent after an interruption"
+        }
+      ],
+      "requires_fields": [
+        "user message text",
+        "message timestamps"
+      ],
+      "confidence": "medium",
+      "fix": "This message is a near-duplicate of the previous one ({detail}). Both are in context. Ask which one governs rather than guessing."
+    },
+    {
+      "id": "R08",
+      "name": "unreachable-url",
+      "summary": "The message contains a URL that does not serve, so the two parties are looking at different things.",
+      "trigger": {
+        "where": "outgoing user message",
+        "match": "contains an http(s) URL"
+      },
+      "check": {
+        "against": "the network",
+        "method": "HEAD the URL; on failure, probe common local dev ports and report what does listen"
+      },
+      "action": "augment",
+      "prompt_to_user": null,
+      "rationale": "Cheapest possible check on the most frequent trigger. The observed instance was benign in itself (a missing :3400) but it produced the session's sharpest trust failure: the assistant reported three consecutive clean e2e runs while the user saw a blank page, and both statements were true.",
+      "metrics": {
+        "instances_triggering": 59,
+        "fire_rate_pct": 13.8,
+        "sessions": null,
+        "precision": null,
+        "measured_cost": "~5 min direct; the trust cost of a false 'all green' is larger and unquantified",
+        "backtest": {
+          "fires": 58,
+          "confirmed": 0,
+          "refuted": 0,
+          "unknown": 58,
+          "basis": "none",
+          "sessions": 18,
+          "precision_labelled": null
+        }
+      },
+      "evidence": [
+        {
+          "session": "a0c27fd2",
+          "at": "20:53:17",
+          "detail": "user: 'how when I go here https://crm-launch.local.oxfordrisk.xyz I see nothing and yet you are testing?' — nothing was bound on :443"
+        }
+      ],
+      "requires_fields": [
+        "user message text",
+        "network egress"
+      ],
+      "confidence": "low-medium",
+      "notes": "One measured instance. Kept because the action is silent, the check is near-free, and it fires often enough to gather precision data quickly.",
+      "fix": "URL(s) in this message: {detail}. If one is not serving, say so explicitly rather than reporting success from a different address — and check the port, since a local dev server on a non-standard port is not reachable at the bare hostname."
+    },
+    {
+      "id": "R09",
+      "name": "unverified-premise",
+      "summary": "The message asserts that a mechanism exists in the codebase when it does not.",
+      "trigger": {
+        "where": "outgoing user message",
+        "match": "declarative claim about an existing mechanism, pattern, or endpoint"
+      },
+      "check": {
+        "against": "the named repos",
+        "method": "grep for the asserted mechanism, including git history"
+      },
+      "action": "ask",
+      "prompt_to_user": "You state X exists. I cannot find it in the named repos. Is this aspirational, or should I look elsewhere?",
+      "rationale": "The brief's requirement #1 was a mechanism that exists nowhere in the estate. It was stated as flat fact while genuinely uncertain details in the same document were carefully hedged, so the confidence markers were inverted: the riskiest claim got the most declarative sentence.",
+      "metrics": {
+        "instances": 1,
+        "sessions": 1,
+        "precision": null,
+        "measured_cost": "25 min of investigation, plus an architecture built on a false premise",
+        "backtest": {
+          "fires": 0,
+          "basis": "none",
+          "confirmed": 0,
+          "refuted": 0,
+          "unknown": 0,
+          "sessions": 0,
+          "precision_labelled": null
+        }
+      },
+      "evidence": [
+        {
+          "session": "a0c27fd2",
+          "at": "13:14:44",
+          "detail": "'Exchange the access token from the ID app for a JWT' — no such exchange exists; the BFF owns it and the browser gets a session cookie. Confirmed by grepping both named repos and their full git histories."
+        }
+      ],
+      "requires_fields": [
+        "user message text",
+        "repo contents",
+        "git history"
+      ],
+      "confidence": "low",
+      "notes": "Highest-value single instance in the corpus but n=1, and the trigger needs claim extraction rather than a regex. Treat as a research item, not a shippable rule.",
+      "fix": {
+        "via": "api",
+        "instruction": "The user asserts a mechanism exists. Check the named repositories for it and report whether it is present, absent, or ambiguous."
+      }
+    },
+    {
+      "id": "R10",
+      "name": "no-acceptance-criterion",
+      "summary": "An open-ended instruction with no definition of done, so 'finished' is decided by the assistant and disputed by the user.",
+      "trigger": {
+        "where": "outgoing user message",
+        "match": "phrases such as 'as good/clean as possible', 'as many times as it takes', 'do it all over again'"
+      },
+      "check": {
+        "against": "nothing",
+        "method": "none required"
+      },
+      "action": "ask",
+      "prompt_to_user": "How will we know this is done? Name a URL, command, or output you will check.",
+      "rationale": "The same instruction was re-sent verbatim an hour apart, because the first attempt satisfied the assistant's criteria and not the user's. Reported success was 17 green tests against a stubbed BFF; observed reality 26 minutes later was a blank page.",
+      "metrics": {
+        "instances": 3,
+        "sessions": 2,
+        "fire_rate_pct": 0.7,
+        "precision": 0.667,
+        "measured_cost": "1h of rework in a0c27fd2, plus a false success report",
+        "backtest": {
+          "fires": 3,
+          "confirmed": 2,
+          "refuted": 1,
+          "unknown": 0,
+          "basis": "auto",
+          "sessions": 2,
+          "precision_labelled": 0.667
+        }
+      },
+      "evidence": [
+        {
+          "session": "a0c27fd2",
+          "at": "19:13:55",
+          "detail": "'spend some time making our code as clean and abstact and good as possible... as many times as it takes'"
+        },
+        {
+          "session": "a0c27fd2",
+          "at": "20:16:07",
+          "detail": "byte-identical instruction re-sent one hour later"
+        }
+      ],
+      "requires_fields": [
+        "user message text"
+      ],
+      "confidence": "low",
+      "fix": "This instruction has no stated definition of done ({detail}). Ask for a concrete acceptance check — a URL to open, a command to run — before starting, and report against that check rather than against your own criteria."
+    },
+    {
+      "id": "R11",
+      "name": "absolute-scope-claim",
+      "summary": "A non-goal stated as a fixed principle when it is really a not-this-build decision, suppressing the questions that would catch it.",
+      "trigger": {
+        "where": "outgoing user message",
+        "match": "absolute scope language: 'no X', 'only two', 'never', 'must not'"
+      },
+      "check": {
+        "against": "nothing",
+        "method": "none required"
+      },
+      "action": "ask",
+      "prompt_to_user": "Is that a fixed architectural principle, or just out of scope for this build?",
+      "rationale": "Roughly half of one brief's emphatic non-goals were reversed within five hours ('no results screen', 'two options, no more'). Emphatic non-goals are worse than silence, because they discourage the assistant from asking whether the scope is real.",
+      "metrics": {
+        "instances": 4,
+        "sessions": 2,
+        "fire_rate_pct": 0.9,
+        "precision": null,
+        "measured_cost": "unmeasured directly; suppressed the clarifying questions that would have surfaced the finances and report screens earlier",
+        "backtest": {
+          "fires": 4,
+          "confirmed": 0,
+          "refuted": 0,
+          "unknown": 4,
+          "basis": "manual",
+          "sessions": 3,
+          "precision_labelled": null
+        }
+      },
+      "evidence": [
+        {
+          "session": "a0c27fd2",
+          "at": "13:14:44",
+          "detail": "'Two options, no more'; 'journey ends, no results screen, no PDF preview' — results page requested 18:11, finances and report 18:38"
+        }
+      ],
+      "requires_fields": [
+        "user message text"
+      ],
+      "confidence": "low",
+      "fix": "This message states an absolute scope limit ({detail}). Ask whether that is a fixed architectural principle or simply out of scope for this build, since the two have different consequences."
+    },
+    {
+      "id": "R12",
+      "name": "dequeue-into-error",
+      "summary": "A queued message is delivered while the API is failing, so the user believes it was sent and the assistant never saw it.",
+      "trigger": {
+        "where": "queue state",
+        "match": "a dequeue within 90s of an apiErrorStatus"
+      },
+      "check": {
+        "against": "the last assistant event",
+        "method": "detect an API error at or near the dequeue"
+      },
+      "action": "resend",
+      "prompt_to_user": null,
+      "rationale": "Pure platform loss with a zero-risk remedy. It also creates a false repeat-send signal: what looks like a user repeating themselves a third time is a server error eating the second attempt.",
+      "metrics": {
+        "instances": 1,
+        "sessions": 1,
+        "precision": 1.0,
+        "measured_cost": "19 min in a0c27fd2 (08:57:52 enqueue -> 08:59:15 dequeue into 529 -> 09:18:18 retyped)",
+        "backtest": {
+          "fires": 3,
+          "confirmed": 3,
+          "refuted": 0,
+          "unknown": 0,
+          "basis": "auto",
+          "sessions": 1,
+          "precision_labelled": 1.0
+        }
+      },
+      "evidence": [
+        {
+          "session": "a0c27fd2",
+          "at": "08:59:15",
+          "detail": "queue dequeued at the same second as an API Error 529; the message was retyped 19 minutes later"
+        }
+      ],
+      "requires_fields": [
+        "queue-operation.operation",
+        "apiErrorStatus"
+      ],
+      "confidence": "low",
+      "notes": "n=1, but the action requires no user attention and cannot make things worse, so it is cheap to ship early and gather data.",
+      "fix": "A queued message was delivered while the API was failing ({detail}) and may never have reached you. If the conversation seems to be missing a step, say so rather than inferring intent."
+    },
+    {
+      "id": "R13",
+      "name": "message-provenance",
+      "summary": "Record how each message came to be, since the assistant currently cannot tell an authored instruction from an accepted suggestion.",
+      "trigger": {
+        "where": "outgoing user message",
+        "match": "always"
+      },
+      "check": {
+        "against": "promptSource",
+        "method": "pass through"
+      },
+      "action": "annotate",
+      "prompt_to_user": null,
+      "rationale": "28 messages were `suggestion_accepted` — the user agreeing to a proposed next step rather than authoring an instruction. 9 were `queued`, sent from a different moment than they were written. Both carry weaker intent than a typed instruction and should be weighted differently when they conflict with something typed.",
+      "metrics": {
+        "instances": 423,
+        "breakdown": {
+          "typed": 355,
+          "system": 65,
+          "suggestion_accepted": 28,
+          "queued": 9
+        },
+        "sessions": 48,
+        "precision": null,
+        "measured_cost": "n/a — enabling data for R01, R07 and R12",
+        "backtest": {
+          "fires": 412,
+          "confirmed": 0,
+          "refuted": 0,
+          "unknown": 412,
+          "basis": "none",
+          "sessions": 47,
+          "precision_labelled": null
+        }
+      },
+      "evidence": [],
+      "requires_fields": [
+        "promptSource",
+        "origin"
+      ],
+      "confidence": "high",
+      "fix": null
+    }
+  ],
+  "build_order": {
+    "ship_first": [
+      "R13",
+      "R02",
+      "R03",
+      "R05",
+      "R08",
+      "R12"
+    ],
+    "reason_first": "All are `augment`, `annotate` or `resend` — no user attention, so low precision costs nothing and they start generating the labels the `ask` rules need.",
+    "ship_after_precision_measured": [
+      "R01",
+      "R04",
+      "R07",
+      "R06"
+    ],
+    "reason_after": "Each interrupts the user. R04 is the highest-cost rule in the catalogue and R01 the best-evidenced, but both need a false-positive rate before they earn an interruption.",
+    "research_only": [
+      "R09",
+      "R10",
+      "R11"
+    ],
+    "reason_research": "n between 1 and 4. Worth writing down; not worth building on."
+  },
+  "open_gaps": [
+    "No rule addresses the assistant asserting a state its own tool output contradicts (observed: 'still running, log ticking' against a stale log; '17 tests all green' against a broken dev server). That is assistant-side, not input-side, so it falls outside this service — but it caused two of the desyncs in this corpus.",
+    "423 messages is a thin backtest set. Rules R09-R12 cannot support a precision estimate. Keep capturing at full fidelity.",
+    "`sessions` count is absent for R05, R06 and R08 because the trigger was measured by regex over the message corpus without per-session attribution."
+  ]
+}
