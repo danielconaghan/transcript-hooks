@@ -1,20 +1,59 @@
 #!/usr/bin/env python3
-"""UserPromptSubmit interceptor — phase 2: silent rules and fire logging.
+"""UserPromptSubmit interceptor — phase 3: asking, dedupe and verdict capture.
 
 Runs the triggers in rules_engine.py against the message you just submitted,
-injects facts for the rules that never interrupt you, and records every fire —
-including the ones that will eventually interrupt you but currently don't.
-
-The point of this phase is to gather real fire rates without changing how it
-feels to use Claude Code. Nothing asks you anything yet.
+injects facts for the rules that never interrupt you, injects a directive for
+the rules that should raise something with you, and records every fire.
 
     press enter
       -> UserPromptSubmit fires with {prompt, session_id, transcript_path, cwd}
+      -> pending fires from the PREVIOUS turn are resolved against this message
+         and written to labels.jsonl (see "the verdict loop")
       -> pre-send state rebuilt from the transcript (incrementally, see below)
       -> rules_engine.evaluate(state)
       -> fires appended to fires.jsonl, ALL of them
-      -> augment-action fires injected via additionalContext
-      -> ask/block-action fires logged only, never surfaced (phase 3)
+      -> augment fires injected every turn via additionalContext
+      -> apply/ask fires injected ONCE PER CAUSE, then marked pending_verdict
+      -> log fires recorded and never surfaced
+
+Set CLAUDE_RESYNC_PHASE=2 to fall back to the silent behaviour — augments only,
+everything else logged. The kill switch exists because phase 3 is the first
+phase that can annoy you, and reaching for the uninstaller instead would also
+stop the measurement.
+
+Dedupe follows the action
+------------------------
+
+An interrupting rule surfaces a given *cause* once per session: a draft you
+withdrew, asked about on every subsequent message, is a nag. A silent augment
+re-states current facts every turn, because that is what makes them current.
+`rules_engine.dedupes()` owns that split and the backtest asks the same
+function, so the runtime and the measurement agree on what one fire is.
+
+Seen keys live in the session cache next to the byte offset. Losing the cache
+re-surfaces a cause at most once more; nothing depends on it being durable.
+
+The verdict loop
+----------------
+
+A hook cannot ask a question and wait — no controlling terminal, and a 30s
+timeout. So the ask happens in band across two turns. Turn N injects a
+directive addressed to the assistant and records the fire as pending. Turn N+1
+reads your reply and parses a verdict *deterministically* — a leading
+yes/no/ignore/skip and nothing cleverer. Anything else stays `unlabelled`,
+because a guessed label is worse than no label: it silently corrupts the
+denominator every other rule is measured against.
+
+Two things deliberately refuse to label:
+
+  * a reply longer than VERDICT_MAX_CHARS — you moved on to the next
+    instruction rather than answering, and a long message that happens to open
+    with "no" is not a verdict
+  * more than one fire pending at once — a bare "yes" cannot be attributed to
+    one of three questions
+
+Verdicts land in labels.jsonl, which backtest.py already reads and lets
+override every heuristic figure.
 
 Why the state read is cheap
 ---------------------------
@@ -54,6 +93,7 @@ Usage:
     python3 intercept.py --uninstall     # remove it
     python3 intercept.py --status        # what is registered, what has fired
     python3 intercept.py --dry-run "some prompt text"
+    python3 intercept.py --verdict "no"  # what that reply would be parsed as
 """
 
 import argparse
@@ -93,22 +133,83 @@ HOME_DIR = resync_home()
 CACHE_DIR = os.path.join(HOME_DIR, "intercept-cache")
 DATA_DIR = os.path.join(HOME_DIR, "data")
 FIRES = os.path.join(DATA_DIR, "fires.jsonl")
+LABELS = os.path.join(DATA_DIR, "labels.jsonl")
 ERRLOG = os.path.join(DATA_DIR, "intercept-errors.log")
 
 # Substring identifying our hook command, for idempotent install/uninstall.
 SENTINEL = "intercept.py"
 
-# Rules that interrupt are logged but not surfaced in this phase.
-PHASE = 2
+
+def phase():
+    """3 normally; 2 falls back to augments-only. Anything unparseable reads as
+    3 rather than failing, because a typo in an env var should not silently
+    switch the service off."""
+    try:
+        return 2 if int(os.environ.get("CLAUDE_RESYNC_PHASE", "3")) <= 2 else 3
+    except Exception:
+        return 3
+
 
 # Cap on retained prior messages. R07 needs only the previous one; R01 compares
 # retractions against sent messages, and a few hundred is ample — an unresolved
 # retraction from 300 messages ago is not a live concern.
 MAX_PRIOR = 300
 
+# Most interrupting fires one session may surface. The catalogue's own
+# budget_finding puts the tolerable ask rate at ~1.4% of messages and predicts
+# a service asking on 20% "will be disabled within a day". Dedupe already stops
+# one cause repeating; this stops many distinct causes arriving at once in a
+# session that happens to trip several rules. Clamped fires are logged with
+# suppressed="ask-budget" rather than dropped silently, so the cap is visible
+# in the data instead of looking like the rules never fired.
+MAX_ASKS_PER_SESSION = 5
+
+# A reply longer than this is treated as moving on, not answering. Verdicts are
+# short by nature; a 400-character instruction that opens with "no" is a new
+# instruction whose first word is coincidence.
+VERDICT_MAX_CHARS = 200
+
 SYS_PREFIX = re.compile(
     r"^\s*<(task-notification|bash-|local-command|system-reminder|command-name)")
 INTERRUPT = re.compile(r"^\[Request interrupted")
+
+# Leading tokens that settle a pending fire. Matched at the start of the reply
+# only, on a word boundary, so "nope" is not read as "no" and a "yes" buried in
+# the third sentence is not read at all. Kept small on purpose: every phrase
+# added here is a chance to mislabel, and `unlabelled` costs nothing.
+VERDICT_AFFIRM = ("yes", "yep", "yeah", "yup", "correct", "right", "true",
+                  "confirmed", "agreed", "do it", "go ahead", "please do",
+                  "good catch", "true enough")
+VERDICT_NEGATE = ("no", "nope", "nah", "ignore", "skip", "wrong", "incorrect",
+                  "false", "irrelevant", "disregard", "not relevant",
+                  "never mind", "nevermind", "don't", "dont", "do not",
+                  "false alarm", "not now")
+
+# Strip conversational scaffolding before looking for the leading token, so
+# "ok, no" and "> yes" parse the same as the bare word.
+RE_VERDICT_LEAD = re.compile(
+    r"^[\s>*_`\-\"'(\[]*(?:ok(?:ay)?|well|hmm+|so|and|but|actually|"
+    r"right then)?[\s,.:;!]*", re.I)
+
+
+def parse_verdict(text):
+    """Map a reply to "applies" / "does-not-apply" / "unlabelled".
+
+    Deterministic by design — see the module docstring. No model, no fuzzy
+    match, no scoring. If it is not obviously one of the two, it is neither."""
+    t = (text or "").strip()
+    if not t or len(t) > VERDICT_MAX_CHARS:
+        return "unlabelled"
+    t = RE_VERDICT_LEAD.sub("", t.lower(), count=1)
+    # Longest phrase first, so "do not" is not shadowed by a bare "do it" and
+    # "not relevant" wins over "not".
+    for phrase, verdict in sorted(
+            [(p, "does-not-apply") for p in VERDICT_NEGATE]
+            + [(p, "applies") for p in VERDICT_AFFIRM],
+            key=lambda kv: -len(kv[0])):
+        if re.match(re.escape(phrase) + r"\b", t):
+            return verdict
+    return "unlabelled"
 
 
 def _now():
@@ -151,9 +252,21 @@ class SessionCache(object):
     30ms to ingest a 2.9 MB transcript cold, 9ms warm."""
 
     def __init__(self, session_id):
-        import rules_engine as E
         self.session_id = session_id
         self.path = os.path.join(CACHE_DIR, "%s.json" % session_id)
+        # Dedupe and verdict state. Deliberately NOT cleared by
+        # reset_transcript_state: a cause is identified by a content hash, so
+        # its identity survives the file being rotated or replaced underneath
+        # us, and a verdict in flight should not be lost to an epoch boundary.
+        self.seen = {}        # fire_key -> iso ts first surfaced
+        self.pending = []     # fires awaiting a verdict from the next message
+        self.asks = 0         # interrupting fires surfaced this session
+        self.reset_transcript_state()
+
+    def reset_transcript_state(self):
+        """Forget where we were in the transcript, keeping what we learned from
+        it. Used when the file turns out to be shorter than we have consumed."""
+        import rules_engine as E
         self.offset = 0
         self.acc = E.new_accumulator()
 
@@ -161,12 +274,22 @@ class SessionCache(object):
         try:
             with open(self.path) as fh:
                 d = json.load(fh)
-            self.offset = int(d.get("offset") or 0)
             acc = d.get("acc")
-            if isinstance(acc, dict) and "msgs" in acc:
-                self.acc = acc
-            else:
+            if not (isinstance(acc, dict) and "msgs" in acc):
                 raise ValueError("cache shape")
+            self.offset = int(d.get("offset") or 0)
+            self.acc = acc
+            # Absent in caches written by phase 2. Defaulting rather than
+            # rejecting means the upgrade costs nothing: an in-flight session
+            # keeps its byte offset and simply starts deduping from now.
+            seen = d.get("seen")
+            self.seen = seen if isinstance(seen, dict) else {}
+            pending = d.get("pending")
+            self.pending = pending if isinstance(pending, list) else []
+            try:
+                self.asks = int(d.get("asks") or 0)
+            except Exception:
+                self.asks = 0
         except Exception:
             self.__init__(self.session_id)   # absent, corrupt, or stale shape
 
@@ -177,7 +300,9 @@ class SessionCache(object):
             acc["msgs"] = acc.get("msgs", [])[-MAX_PRIOR:]
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"offset": self.offset, "acc": acc}, fh,
+                json.dump({"offset": self.offset, "acc": acc,
+                           "seen": self.seen, "pending": self.pending,
+                           "asks": self.asks}, fh,
                           ensure_ascii=False, default=str)
             os.chmod(tmp, 0o600)
             os.replace(tmp, self.path)
@@ -194,8 +319,9 @@ class SessionCache(object):
         if self.offset > size:
             # Shorter than we consumed: rotated, replaced, or a resumed session
             # writing elsewhere. The append-only guarantee is epoch-local, so
-            # do not assume — start again.
-            self.__init__(self.session_id)
+            # do not assume — re-read the file. Seen keys and pending verdicts
+            # survive; they are keyed by content, not by position.
+            self.reset_transcript_state()
         try:
             with open(transcript_path, "rb") as fh:
                 fh.seek(self.offset)
@@ -348,6 +474,32 @@ def render_fix(fire, rule_cfg, state):
 # hook mode
 # --------------------------------------------------------------------------
 
+def resolve_pending(cache, prompt, session_id):
+    """Settle fires left pending by the previous turn against this message.
+
+    Returns the label rows to append. Always clears `pending`: a fire gets one
+    adjacent reply to be judged on, and an unanswered one is `unlabelled`
+    rather than carried forward hunting for a yes somewhere later."""
+    if not cache.pending:
+        return []
+    pending, cache.pending = cache.pending, []
+    # A bare "yes" cannot be attributed when three questions are outstanding.
+    ambiguous = len(pending) > 1
+    verdict = "unlabelled" if ambiguous else parse_verdict(prompt)
+    note = ("%d fires pending; reply cannot be attributed" % len(pending)
+            if ambiguous else re.sub(r"\s+", " ", prompt)[:200])
+    rows = []
+    for p in pending:
+        rows.append({
+            "ts": _iso(_now()), "session_id": session_id,
+            "rule": p.get("rule"), "fire_key": p.get("fire_key"),
+            "verdict": verdict, "note": note,
+            "asked_at": p.get("at"), "asked_prompt_id": p.get("prompt_id"),
+            "action": p.get("action"), "phase": phase(),
+        })
+    return rows
+
+
 def run_hook(payload, dry_run=False):
     import rules_engine as E
     t0 = time.monotonic()
@@ -356,42 +508,96 @@ def run_hook(payload, dry_run=False):
     if not prompt.strip():
         return None
     session_id = payload.get("session_id") or "unknown"
+    prompt_id = payload.get("prompt_id")
     cwd = payload.get("cwd")
     transcript = payload.get("transcript_path")
+    ph = phase()
 
     cache = SessionCache(session_id)
     cache.load()
-    if transcript and os.path.exists(transcript):
-        cache.advance(transcript)
-        if not dry_run:
-            cache.save()   # persist the new offset, or the next call re-reads
-                           # the whole transcript and the incremental read is
-                           # pointless
 
-    resolver = Resolver(cwd=cwd)
-    state = cache.to_state(prompt, cwd, resolver)
-
-    catalogue = E.load_catalogue()
-    by_id = {r["id"]: r for r in catalogue["rules"]}
-    fires = E.evaluate(state)
+    # The verdict is about the PREVIOUS turn's fires, judged on the message
+    # arriving now, so this has to happen before anything new is evaluated.
+    labels = resolve_pending(cache, prompt, session_id)
 
     injections, records = [], []
-    for f in fires:
-        action = E.action_for(f.rule, catalogue)
-        surfaced = False
-        text = None
-        if action == "augment":
-            text = render_fix(f, by_id.get(f.rule), state)
-            if text:
-                injections.append(text)
-                surfaced = True
-        records.append({
-            "ts": _iso(_now()), "session_id": session_id,
-            "prompt_id": payload.get("prompt_id"),
-            "rule": f.rule, "fire_key": f.key, "action": action,
-            "surfaced": surfaced, "phase": PHASE,
-            "why": f.why, "detail": (f.detail or "")[:300],
-        })
+    try:
+        if transcript and os.path.exists(transcript):
+            cache.advance(transcript)
+
+        resolver = Resolver(cwd=cwd)
+        state = cache.to_state(prompt, cwd, resolver)
+
+        catalogue = E.load_catalogue()
+        by_id = {r["id"]: r for r in catalogue["rules"]}
+        fires = E.evaluate(state)
+
+        injections, records = [], []
+        for f in fires:
+            action = E.action_for(f.rule, catalogue)
+            surfaced, deduped, suppressed = False, False, None
+
+            if action == "augment":
+                # Silent, and re-stated every turn: that is what keeps the
+                # facts current. No dedupe, by design.
+                text = render_fix(f, by_id.get(f.rule), state)
+                if text:
+                    injections.append(text)
+                    surfaced = True
+            elif E.dedupes(f.rule, catalogue):
+                # One record per cause, whether or not it surfaces, so live
+                # counts stay comparable with the backtest's. `deduped` rows
+                # are kept rather than dropped — they are how a trigger that
+                # re-fires on a stale cause becomes visible at all.
+                if f.key in cache.seen:
+                    deduped = True
+                elif action == "log":
+                    suppressed = "precision-floor"
+                    cache.seen[f.key] = _iso(_now())
+                elif ph < 3:
+                    suppressed = "phase-2"
+                    cache.seen[f.key] = _iso(_now())
+                elif cache.asks >= MAX_ASKS_PER_SESSION:
+                    suppressed = "ask-budget"
+                    cache.seen[f.key] = _iso(_now())
+                else:
+                    text = render_fix(f, by_id.get(f.rule), state)
+                    if not text:
+                        # {"via": "api"} or no template. Nothing to say, so
+                        # say nothing — but do not mark it asked.
+                        suppressed = "no-template"
+                        cache.seen[f.key] = _iso(_now())
+                    else:
+                        injections.append(text)
+                        surfaced = True
+                        cache.seen[f.key] = _iso(_now())
+                        cache.asks += 1
+                        cache.pending.append({
+                            "rule": f.rule, "fire_key": f.key,
+                            "action": action, "at": _iso(_now()),
+                            "prompt_id": prompt_id})
+
+            rec = {
+                "ts": _iso(_now()), "session_id": session_id,
+                "prompt_id": prompt_id,
+                "rule": f.rule, "fire_key": f.key, "action": action,
+                "surfaced": surfaced, "phase": ph,
+                "why": f.why, "detail": (f.detail or "")[:300],
+            }
+            if deduped:
+                rec["deduped"] = True
+            if suppressed:
+                rec["suppressed"] = suppressed
+            if surfaced and action != "augment":
+                rec["pending_verdict"] = True
+            records.append(rec)
+    finally:
+        # Persist even if evaluation blew up: otherwise the byte offset is lost
+        # and every later call re-reads the whole transcript, and a verdict
+        # already taken off `pending` would vanish with it.
+        if not dry_run:
+            cache.save()
+            append_labels(labels)
 
     elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
     for r in records:
@@ -402,9 +608,12 @@ def run_hook(payload, dry_run=False):
     if not injections:
         return None
     fired_ids = sorted(set(r["rule"] for r in records if r["surfaced"]))
+    asked = sorted(set(r["rule"] for r in records if r.get("pending_verdict")))
+    tag = "intercept: %s%s · %.0fms" % (
+        " ".join(fired_ids), " (asking %s)" % " ".join(asked) if asked else "",
+        elapsed_ms)
     return {
-        "systemMessage": "intercept: %s · %.0fms" % (" ".join(fired_ids),
-                                                      elapsed_ms),
+        "systemMessage": tag,
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": "\n".join(injections),
@@ -412,17 +621,29 @@ def run_hook(payload, dry_run=False):
     }
 
 
-def append_fires(records):
+def _append_jsonl(path, records, what):
     if not records:
         return
     try:
         os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
-        with open(FIRES, "a", encoding="utf-8") as fh:
+        with open(path, "a", encoding="utf-8") as fh:
             for r in records:
                 fh.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
-        os.chmod(FIRES, 0o600)
+        os.chmod(path, 0o600)
     except Exception as exc:
-        log_error("fires append failed: %r" % (exc,))
+        log_error("%s append failed: %r" % (what, exc))
+
+
+def append_fires(records):
+    _append_jsonl(FIRES, records, "fires")
+
+
+def append_labels(records):
+    """Verdicts, in the shape backtest.load_user_labels() reads: it keys on
+    (rule, fire_key) and takes only `applies` / `does-not-apply`. `unlabelled`
+    rows are written anyway — they are the honest denominator, and the reader
+    ignores them."""
+    _append_jsonl(LABELS, records, "labels")
 
 
 # --------------------------------------------------------------------------
@@ -503,15 +724,28 @@ def do_status():
         print("             %s (timeout %ss)" % (h.get("command"),
                                                  h.get("timeout")))
     cat = E.load_catalogue()
-    aug = [r["id"] for r in cat["rules"]
-           if E.action_for(r["id"], cat) == "augment"]
-    other = [r["id"] for r in cat["rules"]
-             if E.action_for(r["id"], cat) != "augment"]
-    print("phase      : %d — injecting %s; logging only %s"
-          % (PHASE, " ".join(aug), " ".join(other)))
+    ph = phase()
+    buckets = {}
+    for r in cat["rules"]:
+        buckets.setdefault(E.action_for(r["id"], cat), []).append(r["id"])
+    print("phase      : %d%s" % (ph, "  (CLAUDE_RESYNC_PHASE=2 — asking off)"
+                                 if ph < 3 else ""))
+    for name, gloss in (("augment", "silent, every turn"),
+                        ("apply", "injects its fix, no question"),
+                        ("ask", "injects a directive, verdict recorded")):
+        print("  %-8s : %-24s (%s)"
+              % (name, " ".join(buckets.get(name, [])) or "-", gloss))
+    floored = buckets.get("log", [])
+    if floored:
+        print("  log only : %s  (precision below the %.0f%% floor)"
+              % (" ".join(floored), E.PRECISION_FLOOR * 100))
+    print("  budget   : max %d interrupting fire(s) per session, once per cause"
+          % MAX_ASKS_PER_SESSION)
+
     if os.path.exists(FIRES):
         import collections
-        c, surfaced, times = collections.Counter(), 0, []
+        c, surfaced, deduped, times = collections.Counter(), 0, 0, []
+        supp = collections.Counter()
         with open(FIRES, errors="replace") as fh:
             for line in fh:
                 try:
@@ -520,10 +754,16 @@ def do_status():
                     continue
                 c[d.get("rule")] += 1
                 surfaced += 1 if d.get("surfaced") else 0
+                deduped += 1 if d.get("deduped") else 0
+                if d.get("suppressed"):
+                    supp[d["suppressed"]] += 1
                 if d.get("elapsed_ms") is not None:
                     times.append(d["elapsed_ms"])
-        print("fires.jsonl: %d record(s), %d surfaced" % (sum(c.values()),
-                                                          surfaced))
+        print("fires.jsonl: %d record(s), %d surfaced, %d deduped"
+              % (sum(c.values()), surfaced, deduped))
+        if supp:
+            print("  suppressed: %s"
+                  % ", ".join("%s=%d" % kv for kv in supp.most_common()))
         if times:
             times.sort()
             print("latency    : median %.1fms, p95 %.1fms, max %.1fms"
@@ -533,6 +773,21 @@ def do_status():
             print("             %-5s %d" % (rid, n))
     else:
         print("fires.jsonl: none yet")
+
+    if os.path.exists(LABELS):
+        import collections
+        v = collections.Counter()
+        with open(LABELS, errors="replace") as fh:
+            for line in fh:
+                try:
+                    v[json.loads(line).get("verdict")] += 1
+                except Exception:
+                    continue
+        print("labels.jsonl: %d verdict(s) — %s"
+              % (sum(v.values()),
+                 ", ".join("%s=%d" % kv for kv in v.most_common()) or "none"))
+    else:
+        print("labels.jsonl: none yet")
     return 0
 
 
@@ -543,6 +798,8 @@ def main(argv=None):
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--dry-run", metavar="PROMPT", default=None,
                     help="evaluate a prompt without writing fires.jsonl")
+    ap.add_argument("--verdict", metavar="REPLY", default=None,
+                    help="show how a reply would be parsed as a verdict")
     args = ap.parse_args(argv)
 
     if args.install:
@@ -551,6 +808,9 @@ def main(argv=None):
         return do_install(remove=True)
     if args.status:
         return do_status()
+    if args.verdict is not None:
+        print(parse_verdict(args.verdict))
+        return 0
     if args.dry_run is not None:
         out = run_hook({"prompt": args.dry_run, "session_id": "dry-run",
                         "cwd": os.getcwd()}, dry_run=True)

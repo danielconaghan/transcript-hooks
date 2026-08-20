@@ -29,8 +29,13 @@ Fire identity
 Each fire carries a `key` that is stable for the thing that caused it, not for
 the message that surfaced it. A retracted draft is one fire however many
 messages follow it, so the interceptor can surface it once and the backtest can
-count it once. `intercept.py` persists seen keys in fires.jsonl; backtest.py
-dedupes within its replay.
+count it once.
+
+`intercept.py` persists seen keys per session in `intercept-cache/<sid>.json`;
+backtest.py dedupes within its replay. Both ask `dedupes()` which causes to
+collapse, so the runtime and the measurement cannot disagree about what "one
+fire" means — the same drift that made the two diverge on notification
+handling once already.
 """
 
 import hashlib
@@ -435,13 +440,34 @@ def evaluate(state, only=None, catalogue=None):
     return fires
 
 
-def action_for(rule_id, catalogue, precision_threshold=0.8):
+# Precision at or above this is trusted enough to act on without asking.
+PRECISION_CEILING = 0.8
+
+# Precision KNOWN to be below this is too wrong to spend attention on. Such a
+# rule still fires and still logs — it just never reaches the user.
+#
+# This floor is the build-time half of the self-tuning rule in PLAN.md ("a rule
+# reaching ~10 labels at under 30% precision should be demoted from ask to
+# log-only"). Waiting for ten labels means ten interruptions that are ~97%
+# noise for a rule the backtest has already measured at 0.038, and the
+# catalogue's own budget_finding says a service that asks too often "will be
+# disabled within a day". A rule measured below the floor starts demoted and
+# earns its way up, rather than annoying its way down.
+#
+# `None` is not "below the floor" — an unmeasured rule asks, because asking is
+# how it acquires the labels that measure it.
+PRECISION_FLOOR = 0.30
+
+
+def action_for(rule_id, catalogue, precision_threshold=PRECISION_CEILING,
+               precision_floor=PRECISION_FLOOR):
     """What the interceptor should do with a fire, derived from the catalogue's
     `action` plus measured precision — not from a second hand-set field.
 
     Returns one of: "augment" (inject, no interruption), "ask" (inject a
     directive to raise it), "apply" (an interrupting rule proven accurate
-    enough to just act), "skip".
+    enough to just act), "log" (fires and is recorded, never surfaced),
+    "skip".
     """
     rule = next((r for r in catalogue["rules"] if r["id"] == rule_id), None)
     if rule is None:
@@ -450,9 +476,28 @@ def action_for(rule_id, catalogue, precision_threshold=0.8):
     if act in ("augment", "annotate", "resend"):
         return "augment"
     prec = (rule.get("metrics") or {}).get("precision")
-    if prec is not None and prec >= precision_threshold:
-        return "apply"
+    if prec is not None:
+        if prec >= precision_threshold:
+            return "apply"
+        if prec < precision_floor:
+            return "log"
     return "ask"
+
+
+def dedupes(rule_id, catalogue):
+    """Whether a cause should be surfaced only once per session.
+
+    Keyed off the action, not the rule, because the two kinds of fire mean
+    different things. An interrupting rule must surface a given cause ONCE — a
+    retracted draft asked about on every subsequent message is a nag. A silent
+    augment re-states current facts every turn, because that is what makes them
+    current. Counting them the same way would either inflate the ask rules or
+    understate the augment rules' true fire rate.
+
+    A `log` rule dedupes too: it is an interrupting rule serving a suspended
+    sentence, and its fire counts have to stay comparable to the day it is
+    promoted."""
+    return action_for(rule_id, catalogue) != "augment"
 
 # --------------------------------------------------------------------------
 # transcript ingestion — shared, so the two callers cannot diverge

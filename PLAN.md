@@ -13,21 +13,66 @@ Read `README.md` first for what the project *is*. This file is what to *do*.
 | --- | --- | --- |
 | 1. shared engine | **done** | `rules_engine.py` — triggers + transcript ingestion, imported by both the backtest and the interceptor. `research/backtest.py` refactored onto it. |
 | 2. silent rules + fire logging | **done, live** | `hooks/intercept.py` registered as a `UserPromptSubmit` hook. Six non-interrupting rules inject; all thirteen log to `data/fires.jsonl`. |
-| 3. asking + labels + API fixes | **not started** | see below |
+| 3. asking + labels | **done, live** | dedupe by cause, two-turn verdict capture into `data/labels.jsonl`, a precision floor, and an ask budget. API-drafted fixes deliberately not built — see below. |
 | 4. fix-efficacy measurement | **not started** | see below |
 
-**Before starting phase 3:** let phase 2 run for at least a few days, then
-compare live fire rates in `~/.claude-resync/data/fires.jsonl` against the
-historical figures in `rules.json`. Divergence is the first sign a trigger is
-broader in practice than it looked in replay — worth fixing before any rule
-starts interrupting.
+**The phase-2 soak was skipped, knowingly.** The original gate here was "let
+phase 2 run a few days, then compare live fire rates against `rules.json`".
+Phase 3 was switched on with 9 real prompts of live data instead. Two things
+substitute for the soak, and both need watching rather than trusting:
+
+- a **precision floor** stops a rule the backtest has *already* measured as bad
+  from ever reaching you (this is what R06 at 3.8% would otherwise have done)
+- an **ask budget** of 5 interrupting fires per session caps the damage if a
+  trigger turns out broader live than in replay
+
+What the soak would have caught and these do not: a trigger whose *live* fire
+rate diverges from its historical one while its precision looks fine. Compare
+`fires.jsonl` against `rules.json` once there is a few days of data, as
+originally planned — the gate was skipped, not made unnecessary.
 
 ---
 
 ## Phase 3 — asking, and the feedback loop
 
-The goal is to make the `ask` and `block` rules usable, and to replace
-heuristic precision with your actual verdicts.
+**Built and live.** The goal was to make the `ask` and `block` rules usable and
+to replace heuristic precision with your actual verdicts. What follows is the
+spec as implemented; where the build departed from the original plan, it says so.
+
+### What is running
+
+`intercept.py` at phase 3:
+
+- **Dedupe by cause.** `rules_engine.dedupes()` owns the policy and both the
+  interceptor and the backtest call it, so they cannot drift on what one fire
+  means. Seen keys live in the session cache beside the byte offset. Repeat
+  observations are still written to `fires.jsonl` tagged `deduped: true` rather
+  than dropped — that tag is what made the original bug visible, and dropping
+  them would hide the next one.
+- **Two-turn verdicts.** Turn N injects and marks the fire pending; turn N+1
+  parses a leading yes/no and appends to `data/labels.jsonl`. It refuses to
+  label a reply over 200 characters (you moved on, and a long instruction
+  opening with "no" is coincidence) or any turn with more than one fire pending
+  (a bare "yes" cannot be attributed). Both refusals write `unlabelled`, which
+  `backtest.load_user_labels` ignores by design.
+- **A precision floor** (`PRECISION_FLOOR = 0.30`) — see the decision below.
+- **An ask budget** (`MAX_ASKS_PER_SESSION = 5`), logged as
+  `suppressed: "ask-budget"` when it clamps, never silently.
+- **A kill switch**: `CLAUDE_RESYNC_PHASE=2` reverts to augments-only without
+  uninstalling, because reaching for the uninstaller would also stop the
+  measurement.
+
+`python3 ~/.claude-resync/intercept.py --status` reports the current routing,
+the suppression counts and the verdict tally. `--verdict "some reply"` shows how
+a reply would parse.
+
+### Not built: API-drafted fixes
+
+Only R09 carries `{"via": "api"}`, and R09 returns no fires by design, so the
+API path would have been unreachable code guarding the one place anything
+leaves this machine. A fire whose template renders nothing is recorded as
+`suppressed: "no-template"` and never marked as asked. Build this when a rule
+that actually fires needs it.
 
 ### The shape, decided
 
@@ -63,21 +108,41 @@ override every heuristic. That wiring exists; nothing fills it yet.
 
 ### Rules that change behaviour in phase 3
 
-`action_for()` in `rules_engine.py` already derives behaviour from `action` plus
-measured precision, threshold 0.8:
+`action_for()` derives behaviour from the catalogue `action` plus measured
+precision, between a floor of 0.30 and a ceiling of 0.80. As currently
+measured — check with `--status`, not from this table:
 
-- **R01** (`ask`, precision 89%) → clears the threshold, so it **applies its fix
-  without asking**. Label comes from whether you object, not from a question.
-- **R04, R06, R07, R10, R11** → ask, and record the verdict
-- **R09** → still returns no fires by design; its trigger needs claim
-  extraction, not a regex, and a guessed regex would put unmeasurable fires
-  into the label stream and corrupt every other rule's denominator
+| runtime action | rules | behaviour |
+| --- | --- | --- |
+| `augment` | R02 R03 R05 R08 R12 R13 | silent, every turn, no dedupe |
+| `apply` | R01 R04 | injects its fix, asks nothing; the label comes from whether you object |
+| `ask` | R07 R09 R10 R11 | injects a directive, verdict recorded |
+| `log` | R06 | fires and is recorded, never surfaced |
+
+R09 still returns no fires by design: its trigger needs claim extraction, not a
+regex, and a guessed regex would put unmeasurable fires into the label stream
+and corrupt every other rule's denominator.
+
+Note this file previously recorded R01 at 89% and the catalogue now says 100% —
+a later backtest run moved it. Both clear the ceiling so the routing is
+unchanged, but **the numbers in this document are stale by construction**; the
+catalogue and `--status` are the record. The current backtest also reports 49
+sessions / 441 messages against the 51 / 423 in `rules.json`'s provenance, so a
+`backtest.py --write` is due.
 
 ### Self-tuning, once labels accumulate
 
 A rule reaching ~10 labels at under 30% precision should be demoted from `ask`
 to log-only automatically, written back into `rules.json`. The annoying
 fortnight then ends by itself rather than needing a decision.
+
+**Half of this is now enforced at build time** by `PRECISION_FLOOR`: a rule
+whose *measured* precision is already under 30% starts demoted instead of
+earning its demotion through ten bad interruptions. What is still missing is the
+write-back — demotion currently follows from the catalogue's precision figure
+being refreshed by `backtest.py --write`, not from a live label count. `None`
+precision is deliberately not floored: an unmeasured rule has to ask in order
+to acquire the labels that measure it.
 
 ### API fixes
 
@@ -196,6 +261,17 @@ unknowns out of 32 as "100%". `floor` is the number to trust.
 **Dedupe follows the action.** Interrupting rules fire once per *cause* (asking
 about the same retracted draft every message is a nag); silent augments fire
 every message (re-stating current task state is what makes it current).
+Implemented in `rules_engine.dedupes()` and called by both the interceptor and
+the backtest. This sat as a written decision with no implementation for a while,
+and the symptom was R01 re-firing one withdrawn draft on five consecutive
+prompts in session `9d3b23cd` — a decision recorded here is not a decision
+running in the code.
+
+**A rule measured as bad never reaches the user.** `PRECISION_FLOOR` in
+`rules_engine.py`. The catalogue's own `budget_finding` predicts a service that
+asks too often "will be disabled within a day", and R06 at 3.8% precision was
+about to become a question on every message naming a path. Unmeasured (`None`)
+is not floored — that rule needs to ask to become measured.
 
 **`rules.json` is canonical in the repo**, deployed by `install.py`, updated by
 `backtest.py --write`. `install.py status` reports drift so a stale catalogue is
@@ -220,8 +296,12 @@ untouched. A hook that can break a session is worse than no hook.
 - **R03 injects a paragraph on the first message of every session.** If that
   reads as noise, gate it on `command_permissions.allowedTools` being
   non-empty — one line in `r03_permission_blocked`.
-- **R06's trigger was broadened** (added `./` to the path pattern), taking it
-  from 40 to 52 historical fires. Revert if it proves noisy in live use.
+- **R06 is the rule to fix next.** Its trigger was broadened (added `./` to the
+  path pattern), taking it from 40 to 53 historical fires — and its precision is
+  3.8%, so the floor now holds it at log-only. It is the highest-volume
+  interrupting rule in the catalogue and it currently reaches nobody. Narrowing
+  the trigger is worth more than any new rule: the fires are real references,
+  the check ("does it resolve") is just too weak to be worth a question.
 - **No rule addresses the assistant asserting a state its own tool output
   contradicts** — observed twice: *"still running, log ticking"* against a
   3.5-minute-stale log, and *"17 tests, all green"* against a dev server it had

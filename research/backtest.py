@@ -182,14 +182,10 @@ def load_fixture():
         sid = b.split(".epoch")[0].split(".inflight")[0]
         groups[sid].append(p)
     cat = E.load_catalogue()
-    # Dedupe policy follows the action, because the two kinds of rule have
-    # different notions of a "fire". An interrupting rule must surface a given
-    # cause ONCE — a retracted draft asked about on every subsequent message
-    # is a nag. A silent augment re-states current facts every turn, because
-    # that is what makes them current. Counting them the same way would either
-    # inflate the ask rules or understate the augment rules' true fire rate.
-    dedupe = {r["id"] for r in cat["rules"]
-              if E.action_for(r["id"], cat) != "augment"}
+    # Dedupe policy lives in rules_engine.dedupes so the interceptor and this
+    # replay cannot disagree about what counts as one fire. See its docstring
+    # for why the policy follows the action rather than the rule.
+    dedupe = {r["id"] for r in cat["rules"] if E.dedupes(r["id"], cat)}
     fixture = {}
     for sid, paths in groups.items():
         rows = load_session_events(sid, paths)
