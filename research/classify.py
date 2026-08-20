@@ -168,17 +168,31 @@ Judge how the directive is DELIVERED, not how important it is:
              full force. Never mark a message weakened merely for being polite.
   weakened   The force is reduced by how it is phrased, so a reader could take
              it as optional, as curiosity, or as an open question when it is
-             not. Record which form in `weakening`:
-               hedge           "i think", "i believe", "looks like", "not
-                               sure", "maybe", "i would like to", "i thought"
-               understatement  the problem described as smaller than it is:
-                               "a slight issue", "a bit off", "minor problem"
-               interrogative   an assertion or instruction delivered as a
-                               question: "should it be taking this long?",
-                               "Are you aware that v4 and v5 have different
-                               microservices?", "the monthly ones haven't run
-                               in the last month, so i think they should be run
-                               as well?"
+             not. Set EVERY form that applies — these overlap constantly and a
+             message is often two or three at once:
+
+             `hedged` — the developer's certainty is presented as lower than it
+             is: "i think", "i believe", "looks like", "not sure", "i would
+             like to", "i thought", "maybe".
+
+             `understated` — the SIGNIFICANCE is downplayed. This is about
+             scale, not vocabulary, and it is the easiest one to miss. Judge the
+             gap between how big the thing is and how small it is made to sound:
+               "I'm a little confused we should be able to one-to-one replay org
+                service with crm service" — a fundamental architecture mismatch,
+                called mild confusion
+               "finances are handled a bit differently" — materially different
+               "I would prefer a please," — a reprimand delivered as taste
+               "this previously worked, the only thing we really changed is the
+                DB seeding" — names the cause of a total breakage as a detail
+             A genuinely small problem described as small is NOT understatement.
+             The tell is a serious consequence wrapped in mild language.
+
+             `interrogative` — an assertion or instruction delivered as a
+             question. Includes rhetorical questions and claims embedded in
+             questions: "should it be taking this long?", "Are you aware that v4
+             and v5 have different microservices?", "the monthly ones haven't
+             run in the last month, so i think they should be run as well?"
   none       Not a directive at all. Reserve this for a message that seeks
              information and asserts nothing: "where is login?", "what does
              ./do down stop?". Also an answer to something the assistant asked,
@@ -223,14 +237,21 @@ DIRECTIVE_SCHEMA = {
     "properties": {
         "is_directive": {"type": "boolean"},
         "strength": {"type": "string", "enum": ["direct", "weakened", "none"]},
-        "weakening": {"type": "string", "enum": [
-            "none", "hedge", "understatement", "interrogative", "multiple"]},
+        # Three independent flags, not one enum. As a single choice `hedge`
+        # absorbed every understated message — "I'm a little confused we should
+        # be able to one-to-one replay org service with crm service" is both,
+        # and the model could only say one, so `understatement` came back 0 of
+        # 448. These forms overlap constantly; forcing a winner destroyed the
+        # category that mattered most.
+        "hedged": {"type": "boolean"},
+        "understated": {"type": "boolean"},
+        "interrogative": {"type": "boolean"},
         "content": {"type": "string"},
         "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
         "reason": {"type": "string"},
     },
-    "required": ["is_directive", "strength", "weakening", "content",
-                 "confidence", "reason"],
+    "required": ["is_directive", "strength", "hedged", "understated",
+                 "interrogative", "content", "confidence", "reason"],
     "additionalProperties": False,
 }
 
@@ -434,10 +455,20 @@ def main(argv=None):
             print("%-8s %-14s %d" % ("yes" if yes else "no", kind, c))
         print("\nnext: --compare to see where this disagrees with the regexes")
     else:
-        d = collections.Counter((r["strength"], r["weakening"]) for r in rows)
-        print("\n%-10s %-16s %s" % ("strength", "weakening", "count"))
-        for (st, wk), c in d.most_common():
-            print("%-10s %-16s %d" % (st, wk, c))
+        d = collections.Counter(r["strength"] for r in rows)
+        print("\n%-10s %s" % ("strength", "count"))
+        for st, c in d.most_common():
+            print("%-10s %d" % (st, c))
+        print("\nforms (independent, so they overlap):")
+        for f in ("hedged", "understated", "interrogative"):
+            n = sum(1 for r in rows if r.get(f))
+            print("   %-14s %d" % (f, n))
+        combos = collections.Counter(
+            tuple(f for f in ("hedged", "understated", "interrogative")
+                  if r.get(f)) for r in rows if r["strength"] == "weakened")
+        print("\ncombinations among weakened:")
+        for c, n in combos.most_common():
+            print("   %-34s %d" % ("+".join(c) or "(none flagged)", n))
         conf = collections.Counter(r["confidence"] for r in rows)
         print("\nconfidence: %s" % dict(conf))
     return 0

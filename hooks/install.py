@@ -10,7 +10,8 @@ Everything installed lives in one global home, `~/.claude-resync`:
         rules.json           # the rule catalogue (deployed copy)
         corpus/              # raw captures (0700, gitignored)
         refined/             # lossless reduction (0700, gitignored)
-        data/                # fires.jsonl, labels.jsonl, error logs
+        data/                # fires.jsonl, labels.jsonl, normalise.jsonl,
+                             # desync.jsonl, directive.jsonl, error logs
         intercept-cache/     # per-session incremental state
         .venv/               # the anthropic SDK, for API-drafted fixes
         .env                 # ANTHROPIC_API_KEY (0600), never in the repo

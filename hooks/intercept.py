@@ -146,6 +146,10 @@ DATA_DIR = os.path.join(HOME_DIR, "data")
 FIRES = os.path.join(DATA_DIR, "fires.jsonl")
 LABELS = os.path.join(DATA_DIR, "labels.jsonl")
 ERRLOG = os.path.join(DATA_DIR, "intercept-errors.log")
+# Every invocation of the normalisation layer, so "does it pay for itself?" is
+# answerable rather than a matter of opinion: latency paid, and whether it had
+# anything to say.
+NORMALISE_LOG = os.path.join(DATA_DIR, "normalise.jsonl")
 # Credentials for the API-drafted fixes. Outside the repo, 0600. A hook does
 # not see your shell's exports, so this file is how a key reaches it.
 ENVFILE = os.path.join(HOME_DIR, ".env")
@@ -241,6 +245,11 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+def _sha_text(s):
+    import hashlib
+    return hashlib.sha1((s or "").encode("utf-8", "replace")).hexdigest()[:16]
+
+
 def _ts(s):
     try:
         return datetime.fromisoformat((s or "").replace("Z", "+00:00"))
@@ -287,6 +296,8 @@ class SessionCache(object):
         self.pending = []     # fires awaiting a verdict from the next message
         self.asks = 0         # interrupting fires surfaced this session
         self.drafted = {}     # "rule|key" -> API-drafted text, to avoid re-paying
+        self.normalised = {}  # prompt hash -> restatement, "" for a SKIP
+        self.norm_fails = 0   # consecutive normalisation failures, for the breaker
         self.reset_transcript_state()
 
     def reset_transcript_state(self):
@@ -318,6 +329,12 @@ class SessionCache(object):
                 self.asks = 0
             drafted = d.get("drafted")
             self.drafted = drafted if isinstance(drafted, dict) else {}
+            norm = d.get("normalised")
+            self.normalised = norm if isinstance(norm, dict) else {}
+            try:
+                self.norm_fails = int(d.get("norm_fails") or 0)
+            except Exception:
+                self.norm_fails = 0
         except Exception:
             self.__init__(self.session_id)   # absent, corrupt, or stale shape
 
@@ -330,7 +347,9 @@ class SessionCache(object):
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump({"offset": self.offset, "acc": acc,
                            "seen": self.seen, "pending": self.pending,
-                           "asks": self.asks, "drafted": self.drafted}, fh,
+                           "asks": self.asks, "drafted": self.drafted,
+                           "normalised": self.normalised,
+                           "norm_fails": self.norm_fails}, fh,
                           ensure_ascii=False, default=str)
             os.chmod(tmp, 0o600)
             os.replace(tmp, self.path)
@@ -621,6 +640,180 @@ def draft_via_api(spec, fire, state):
         return None, "error"
 
 
+# --------------------------------------------------------------------------
+# normalisation layer
+# --------------------------------------------------------------------------
+#
+# Not a rule, and deliberately outside rules.json.
+#
+# A rule needs a deterministic trigger. Whether a directive is weakened —
+# hedged, understated, or delivered as a question — cannot be determined
+# deterministically: a regex over 448 messages found understatement 0 times,
+# and the model found 15. Any trigger written for it either fires on nearly
+# everything (weakening is the ambient register) or misses most of it, so the
+# trigger would not be detecting anything. It would be a cost gate wearing a
+# rule's clothes, with a precision field it could never earn.
+#
+# So this always runs and the model is the detector. SKIP is the no-op. It makes
+# no prediction and claims no precision — it restates a buried instruction at
+# full force, which cannot do harm even when it was not needed.
+#
+# It is a third category alongside the two the project already names: not a
+# preventative action (it predicts nothing) and not a retrospective marker (it
+# reports nothing). It normalises the input.
+#
+# The cost is real and paid on every message: measured 1.6s on Haiku, 3.0s on
+# Sonnet, 5.5s on Opus. Haiku by default for that reason. Whether it pays for
+# itself is a phase 4 question, which is why every invocation is logged.
+NORMALISE_MODEL = "claude-haiku-4-5"
+NORMALISE_TIMEOUT_S = 4.0
+NORMALISE_MAX_TOKENS = 300
+
+# After this many consecutive failures the layer stops trying for the rest of
+# the session. Without it, an unreachable API would add the full timeout to
+# every message you send — the one failure mode that would make this
+# intolerable rather than merely slow.
+NORMALISE_MAX_FAILS = 3
+
+NORMALISE_SYSTEM = """\
+A developer has sent the message below to an AI coding assistant. Its force may \
+be reduced by how it is phrased — an epistemic hedge, an understatement, or an \
+instruction delivered as a question — so the assistant might read a correction \
+or an instruction as mere curiosity and fail to act on it.
+
+Write one or two sentences addressed to the ASSISTANT, restating what the \
+developer is actually asking for or asserting, at full force.
+
+Rules, in order of importance:
+
+1. Restore FORCE, never CONFIDENCE — the one rule that must not be broken.
+   "Force" is whether this is an instruction. "Confidence" is whether the claim
+   is true. Raise the first, never the second.
+     Given "i think the Useful URLs are incorrect, now":
+       WRONG  "The Useful URLs need updating because they are now incorrect."
+              (asserts as fact what he offered as a belief)
+       RIGHT  "His message functions as an instruction: he believes the Useful
+              URLs are now incorrect and wants them checked."
+   Attribute the belief to him. Never state it as established. Putting words in
+   his mouth is worse than leaving the hedge alone.
+2. Be respectful. Never characterise the developer or his communication — not
+   unclear, not indirect, not frustrated, not annoyed, not telling you off.
+   Describe the message, never the person.
+3. Politeness is not noise. "please", "can you", "would you mind" are his
+   normal register and carry full force. Never present removing them as a
+   correction, and never treat their presence as weakening.
+4. Never fabricate a quote. Paraphrase, or quote verbatim.
+5. Address the assistant, never the developer. No imperatives aimed at him.
+6. Be brief and plain. No preamble, no restating these rules.
+
+Reply with exactly SKIP — adding nothing else — whenever there is no weakening \
+to undo. That is the common case and it costs nothing, whereas a restatement \
+that adds no information is noise on a message that was already clear. SKIP when:
+
+  * the message is ALREADY a direct instruction or assertion. "please fix
+    manifest.local.json still isn't gitignored" is an imperative; repeating it
+    back helps nobody. Only restate when the force is genuinely reduced.
+  * it is a genuine question seeking information
+  * it is an answer to something the assistant asked
+  * it is pasted specification, brief, or reference material
+  * your restatement would say no more than the message already says\
+"""
+
+
+def normalise_enabled():
+    """Its own switch, separate from CLAUDE_RESYNC_API, because this one is paid
+    on every message rather than on a rule firing — it deserves to be turnable
+    off without disabling the API-drafted fixes too."""
+    if not api_enabled():
+        return False
+    return (os.environ.get("CLAUDE_RESYNC_NORMALISE", "1").strip().lower()
+            not in FALSY_ENV)
+
+
+def normalise(prompt, cache=None):
+    """Restate a weakened directive at full force. Returns (text, status, ms).
+
+    text is None when there is nothing to say, which is the common case."""
+    t0 = time.monotonic()
+    if not normalise_enabled():
+        return None, "off", 0.0
+    if len((prompt or "").strip()) < 15:
+        return None, "too-short", 0.0
+    key = _sha_text(prompt)
+    if cache is not None and key in cache.normalised:
+        return (cache.normalised[key] or None), "cached", 0.0
+    if cache is not None and cache.norm_fails >= NORMALISE_MAX_FAILS:
+        return None, "circuit-open", 0.0
+
+    anthropic = import_anthropic()
+    if anthropic is None:
+        return None, "sdk-missing", 0.0
+    load_env_file()
+    try:
+        client = anthropic.Anthropic()
+        resp = client.with_options(
+            timeout=NORMALISE_TIMEOUT_S, max_retries=0).messages.create(
+                model=NORMALISE_MODEL, max_tokens=NORMALISE_MAX_TOKENS,
+                system=NORMALISE_SYSTEM,
+                messages=[{"role": "user", "content": prompt[:4000]}])
+        ms = round((time.monotonic() - t0) * 1000, 1)
+        if resp.stop_reason == "refusal":
+            return None, "refusal", ms
+        text = " ".join(b.text for b in resp.content
+                        if getattr(b, "type", None) == "text").strip()
+        if cache is not None:
+            cache.norm_fails = 0
+        if not text or text.rstrip(".").upper() == "SKIP":
+            if cache is not None:
+                cache.normalised[key] = ""      # remember the silence too
+            return None, "skip", ms
+        if cache is not None:
+            cache.normalised[key] = text
+        return text, "restated", ms
+    except Exception as exc:
+        if cache is not None:
+            cache.norm_fails += 1
+        log_error("normalise failed: %r" % (exc,))
+        return None, "error", round((time.monotonic() - t0) * 1000, 1)
+
+
+def append_normalise(row):
+    _append_jsonl(NORMALISE_LOG, [row], "normalise")
+
+
+def do_normalise_log(limit=20, restated_only=True):
+    """Before and after, side by side — what you typed against the restatement.
+
+    The transcript holds both but merges every injection in a turn into one
+    additionalContext string, so the pair is only recoverable from this log."""
+    if not os.path.exists(NORMALISE_LOG):
+        print("no invocations yet (%s)" % NORMALISE_LOG)
+        return 0
+    rows = []
+    with open(NORMALISE_LOG, errors="replace") as fh:
+        for line in fh:
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    shown = [r for r in rows
+             if not restated_only or r.get("status") == "restated"]
+    import collections
+    st = collections.Counter(r.get("status") for r in rows)
+    print("%d invocation(s): %s\n"
+          % (len(rows), ", ".join("%s=%d" % kv for kv in st.most_common())))
+    for r in shown[-max(1, limit):]:
+        print("-" * 74)
+        print("%s  %s  %.0fms" % ((r.get("ts") or "")[11:19],
+                                  r.get("status"), r.get("elapsed_ms") or 0))
+        print("  you typed  : %s" % " ".join((r.get("prompt") or "").split())[:300])
+        print("  restated as: %s" % " ".join((r.get("restatement") or "").split())[:300])
+    if restated_only and st.get("skip"):
+        print("\n(%d skipped invocation(s) hidden — pass --all to include them)"
+              % st["skip"])
+    return 0
+
+
 def render_fix(fire, rule_cfg, state, cache=None):
     """Text to inject for one fire. Returns (text, api_status).
 
@@ -736,6 +929,24 @@ def run_hook(payload, dry_run=False):
     labels = resolve_pending(cache, prompt, session_id)
 
     injections, records = [], []
+    norm_text, norm_status, norm_ms = normalise(prompt, cache)
+    if norm_text:
+        injections.append(norm_text)
+    if not dry_run:
+        append_normalise({
+            "ts": _iso(_now()), "session_id": session_id,
+            "prompt_id": prompt_id, "status": norm_status,
+            "elapsed_ms": norm_ms, "model": NORMALISE_MODEL,
+            "prompt_chars": len(prompt),
+            # The original alongside the restatement, so before/after is one
+            # row rather than a join across two files. The transcript has both
+            # too, but every injection in a turn is merged into a single
+            # additionalContext string there, so the pair cannot be recovered
+            # from it. Same secrets exposure as fires.jsonl, which already
+            # keeps up to 300 chars of prompt in `detail`.
+            "prompt": prompt[:1000],
+            "restatement": (norm_text or "")[:1000],
+        })
     try:
         if transcript and os.path.exists(transcript):
             cache.advance(transcript)
@@ -829,9 +1040,10 @@ def run_hook(payload, dry_run=False):
         return None
     fired_ids = sorted(set(r["rule"] for r in records if r["surfaced"]))
     asked = sorted(set(r["rule"] for r in records if r.get("pending_verdict")))
-    tag = "intercept: %s%s · %.0fms" % (
-        " ".join(fired_ids), " (asking %s)" % " ".join(asked) if asked else "",
-        elapsed_ms)
+    tag = "intercept: %s%s%s · %.0fms" % (
+        " ".join(fired_ids) or "-",
+        " (asking %s)" % " ".join(asked) if asked else "",
+        " +normalised" if norm_text else "", elapsed_ms)
     return {
         "systemMessage": tag,
         "hookSpecificOutput": {
@@ -1174,6 +1386,34 @@ def do_status():
     else:
         print("fires.jsonl: none yet")
 
+    if os.path.exists(NORMALISE_LOG):
+        import collections
+        st, times = collections.Counter(), []
+        with open(NORMALISE_LOG, errors="replace") as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                st[d.get("status")] += 1
+                if d.get("elapsed_ms"):
+                    times.append(d["elapsed_ms"])
+        n = sum(st.values())
+        print("normalise  : %d invocation(s) — %s"
+              % (n, ", ".join("%s=%d" % kv for kv in st.most_common())))
+        if n:
+            print("             restated %.0f%% of messages"
+                  % (100.0 * st.get("restated", 0) / n))
+        if times:
+            times.sort()
+            print("             latency median %.0fms, p95 %.0fms, max %.0fms "
+                  "— paid on EVERY message"
+                  % (times[len(times) // 2],
+                     times[int(len(times) * 0.95)], times[-1]))
+        print("             before/after: intercept.py --normalise-log")
+    else:
+        print("normalise  : no invocations yet")
+
     if os.path.exists(LABELS):
         import collections
         v = collections.Counter()
@@ -1218,6 +1458,12 @@ def main(argv=None):
                          "--todo")
     ap.add_argument("--todo", action="store_true",
                     help="with --recent, show only fires with no verdict yet")
+    ap.add_argument("--normalise-log", nargs="?", type=int, const=20,
+                    default=None, metavar="N",
+                    help="show the last N normalisations: what you typed "
+                         "against how it was restated")
+    ap.add_argument("--all", action="store_true",
+                    help="with --normalise-log, include skipped invocations")
     ap.add_argument("--rule", default=None,
                     help="with --recent, restrict to this rule id")
     args = ap.parse_args(argv)
@@ -1228,6 +1474,8 @@ def main(argv=None):
         return do_install(remove=True)
     if args.status:
         return do_status()
+    if args.normalise_log is not None:
+        return do_normalise_log(args.normalise_log, not args.all)
     if args.recent is not None:
         return do_recent(args.recent, args.rule, args.session, args.todo)
     if args.label:
