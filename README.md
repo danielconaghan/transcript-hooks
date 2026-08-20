@@ -279,7 +279,7 @@ python3 research/backtest.py --write         # fold precision into rules.json
 
 A `UserPromptSubmit` hook. Rebuilds the pre-send state, evaluates the rules,
 logs every fire to `data/fires.jsonl`, and injects context for the rules that
-never interrupt you. Typical latency **0–1 ms**; state is read incrementally
+never interrupt you. Measured latency **median 18 ms, p95 47 ms**; state is read incrementally
 using a byte offset, so a long session costs no more than a short one.
 
 Currently phase 3. Silent rules inject every turn; interrupting rules inject

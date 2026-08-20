@@ -85,7 +85,13 @@ local dev servers live, and the case the rule exists for. A public host is
 never probed and never resolved: DNS for one public hostname measured 73ms on
 the critical path, to conclude the host is public and skip it. Reading
 /etc/hosts instead is one cached file read and answers the only useful
-question. Total hook latency with URLs, paths and endpoints present: 1-2ms.
+question.
+
+Latency, measured rather than estimated: median 18ms, p95 47ms for the
+deterministic path (see `--status`). A rule with an API-drafted fix adds up to
+API_TIMEOUT_S on the first message citing a given set of references — measured
+5.5s for claude-opus-5 — and nothing after that, because the draft is cached per
+cause for the session. `CLAUDE_RESYNC_API=0` removes it entirely.
 
 Usage:
     python3 intercept.py                 # hook mode: payload on stdin
@@ -94,6 +100,11 @@ Usage:
     python3 intercept.py --status        # what is registered, what has fired
     python3 intercept.py --dry-run "some prompt text"
     python3 intercept.py --verdict "no"  # what that reply would be parsed as
+    python3 intercept.py --recent [N] [--rule R06] [--session S] [--todo]
+    python3 intercept.py --label R06 --key K --verdict applies --note "..."
+
+Note `--verdict` does double duty: alone it shows how a reply would parse, and
+with --label it is the verdict being recorded.
 """
 
 import argparse
@@ -139,8 +150,19 @@ ERRLOG = os.path.join(DATA_DIR, "intercept-errors.log")
 # not see your shell's exports, so this file is how a key reaches it.
 ENVFILE = os.path.join(HOME_DIR, ".env")
 
-# Substring identifying our hook command, for idempotent install/uninstall.
-SENTINEL = "intercept.py"
+# Substrings identifying a hook command as ours, for idempotent install and
+# surgical uninstall. Path-qualified rather than the bare filename so
+# --uninstall can never strip an unrelated hook that happens to mention
+# "intercept.py". Kept in step with install.py's SENTINELS, and listing the
+# pre-rename home so uninstall still works on an older install.
+SENTINELS = (
+    ".claude-resync/intercept.py",
+    ".claude-transcripts/intercept.py",    # legacy
+)
+
+
+def is_ours(command):
+    return isinstance(command, str) and any(x in command for x in SENTINELS)
 
 
 def phase():
@@ -1026,7 +1048,7 @@ def do_install(remove=False):
     kept = []
     for g in groups:
         inner = [h for h in (g.get("hooks") or [])
-                 if SENTINEL not in (h.get("command") or "")]
+                 if not is_ours(h.get("command"))]
         if inner:
             kept.append(dict(g, hooks=inner))
     if remove:
@@ -1063,7 +1085,7 @@ def do_status():
     except Exception:
         hooks = None
     ours = [h for g in (hooks or []) for h in (g.get("hooks") or [])
-            if SENTINEL in (h.get("command") or "")]
+            if is_ours(h.get("command"))]
     print("registered : %s" % ("yes" if ours else "no"))
     for h in ours:
         print("             %s (timeout %ss)" % (h.get("command"),
