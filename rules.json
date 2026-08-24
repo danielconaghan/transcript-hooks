@@ -157,7 +157,8 @@
         "task-notification tool-use-id"
       ],
       "confidence": "high",
-      "fix": "Background task status check: {detail} launched with no completion notification. Treat their state as unknown — verify with a liveness probe (is output still growing?) before reporting progress on them, and report a stall as a stall rather than as work in progress."
+      "fix": "Background task status check: {detail} launched with no completion notification. Treat their state as unknown — verify with a liveness probe (is output still growing?) before reporting progress on them, and report a stall as a stall rather than as work in progress.",
+      "notes": "FIXED 2026-08-24 (missing terminal state). The trigger was 'launched, minus notified', and a task killed with TaskStop never emits a completion notification, so killing one pinned it as stale for the rest of the session. Measured live in 83af4ae1: `./do up` was stopped at 09:05:02 and R02 reported it outstanding on 6 of the next 8 messages, spanning 2h04m to 11:09 - 6 of the 17 fires the service surfaced in the whole 2026-08-21..24 soak. Ingestion now learns the task_id<->tool_use_id mapping (only the launch result and the notification state both ids) and records a confirmed TaskStop in a third table, `ended`, kept separate from `notified` because the fire text says 'no completion notification' and for a stopped task that remains true. Effect: corpus fires 26 -> 19 with no other rule changed; replaying 83af4ae1 keeps the legitimate 09:04 fire and drops all six later ones. This is the SECOND missing transition in the same state machine - the first, discarded queued_command attachments, is recorded in rules_engine.ingest_line's header comment."
     },
     {
       "id": "R03",

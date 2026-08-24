@@ -117,6 +117,11 @@ class PreSendState(object):
                     user-rejected/permission-rule/...
     launches        {tool_use_id: at} background command launches
     notified        {tool_use_id: at} task notifications received
+    ended           {tool_use_id: at} background tasks ended WITHOUT a
+                    notification — currently a confirmed TaskStop. A third
+                    state, not a kind of notification: a stopped task never
+                    emits one, so folding it into `notified` would make the
+                    fire text ("no completion notification") a lie.
     api_errors      [at] assistant API failures
     denials         {"kind","at"} tool denials seen so far
     resolver        optional object with .exists(path) / .repo_has(repo, needle)
@@ -127,7 +132,7 @@ class PreSendState(object):
     def __init__(self, prompt, at=None, session_id=None, cwd=None,
                  prior_msgs=None, queue_ops=None, questions=None,
                  launches=None, notified=None, api_errors=None, denials=None,
-                 resolver=None):
+                 resolver=None, ended=None):
         self.prompt = prompt or ""
         self.at = at
         self.session_id = session_id
@@ -137,6 +142,7 @@ class PreSendState(object):
         self.questions = questions or []
         self.launches = launches or {}
         self.notified = notified or {}
+        self.ended = ended or {}
         self.api_errors = api_errors or []
         self.denials = denials or []
         self.resolver = resolver
@@ -199,17 +205,35 @@ def _unresolved_retractions(state):
     return out
 
 
+def _terminated(table, tid, at):
+    """Whether `table` records this task ending at or before `at`.
+
+    The `at` guard is what keeps the backtest honest: replaying a historical
+    message must not see an ending that had not happened yet."""
+    t = (table or {}).get(tid)
+    return t is not None and not (at and t > at)
+
+
 def _stale_tasks(state):
-    """Background launches with no notification yet. The assistant's belief
-    about these is unverifiable from its own context, which is what makes it
-    assert progress it cannot see."""
+    """Background launches that have not ended by any known route. The
+    assistant's belief about these is unverifiable from its own context, which
+    is what makes it assert progress it cannot see.
+
+    Two routes end a task, and for a long time only one was known here. A
+    completion notification arrives for a task that ran to the end; a confirmed
+    TaskStop is the record for one that was killed, which never notifies. With
+    only the first, killing a task pinned it as stale for the rest of the
+    session — measured on 2026-08-24 as six consecutive fires over 2h04m about
+    a task stopped at 09:05."""
     stale = []
     for tid, when in (state.launches or {}).items():
         if state.at and when and when >= state.at:
             continue
-        n = state.notified.get(tid)
-        if n is None or (state.at and n > state.at):
-            stale.append(tid)
+        if _terminated(state.notified, tid, state.at):
+            continue
+        if _terminated(getattr(state, "ended", None), tid, state.at):
+            continue
+        stale.append(tid)
     return stale
 
 
@@ -575,6 +599,12 @@ def dedupes(rule_id, catalogue):
 OUR_ATTACHMENTS = frozenset({"hook_additional_context", "hook_system_message"})
 
 RE_TOOL_USE_ID = re.compile(r"<tool-use-id>(.*?)</tool-use-id>")
+RE_TASK_ID = re.compile(r"<task-id>(.*?)</task-id>")
+# "Command running in background with ID: bro2g3t4l. Output is being..." — the
+# launch result is one of only two places that states which background task id
+# belongs to which tool_use_id. Bounded character class, not \S+, because the
+# id is followed immediately by a full stop.
+RE_BG_TASK_ID = re.compile(r"running in background with ID: ([A-Za-z0-9_-]+)")
 _SYS_PREFIX = re.compile(
     r"^\s*<(task-notification|bash-|local-command|system-reminder|command-name)")
 _INTERRUPT = re.compile(r"^\[Request interrupted")
@@ -592,8 +622,13 @@ MAX_QUEUE_OPS = 400
 
 
 def new_accumulator():
+    # task_ids/stops/ended are the background-task bookkeeping added for R02.
+    # Every read of them goes through .get()/.setdefault() because a cache
+    # written before they existed is still loaded verbatim (see the cache
+    # shape check in intercept.py: it validates "msgs" and nothing else).
     return {"msgs": [], "queue_ops": [], "questions": [], "launches": {},
-            "notified": {}, "api_errors": [], "denials": [], "pending_q": {}}
+            "notified": {}, "api_errors": [], "denials": [], "pending_q": {},
+            "task_ids": {}, "stops": {}, "ended": {}}
 
 
 def _text_of(msg):
@@ -612,7 +647,46 @@ def _note_notification(acc, text, when):
     m = RE_TOOL_USE_ID.search(text)
     if m:
         acc["notified"][m.group(1)] = when
+    mt = RE_TASK_ID.search(text)
+    if m and mt:
+        # A notification names both ids, so it is the second source for the
+        # mapping TaskStop needs. Cheap to record and it covers a task whose
+        # launch result was consumed before this table existed.
+        acc.setdefault("task_ids", {})[mt.group(1)] = m.group(1)
     return True
+
+
+def _note_task_result(acc, block, when):
+    """Two background-task facts that only a tool RESULT carries.
+
+    The launch result names the background task id; the launch itself names
+    only its tool_use_id, and TaskStop names only the task id. Without this the
+    two identifier spaces never meet, so a stop cannot be matched to the thing
+    it stopped.
+
+    A confirmed TaskStop is a terminal state exactly like a completion
+    notification — but it is NOT one, because a stopped task never emits a
+    notification. That is why R02 reported `./do up` as outstanding for 2h04m
+    after it was deliberately killed on 2026-08-24: "launched, minus notified"
+    has no state for "ended some other way"."""
+    tuid = block.get("tool_use_id")
+    if not tuid:
+        return
+    body = block.get("content")
+    if not isinstance(body, str):
+        body = " ".join(x.get("text", "") for x in body or []
+                        if isinstance(x, dict) and x.get("type") == "text")
+    body = body or ""
+    m = RE_BG_TASK_ID.search(body)
+    # Gated on the tool_use_id being a known launch: the same sentence quoted
+    # in ordinary command output must not register a mapping.
+    if m and tuid in (acc.get("launches") or {}):
+        acc.setdefault("task_ids", {})[m.group(1)] = tuid
+    task_id = (acc.get("stops") or {}).get(tuid)
+    if task_id and not block.get("is_error"):
+        launch = (acc.get("task_ids") or {}).get(task_id)
+        if launch:
+            acc.setdefault("ended", {})[launch] = when
 
 
 def ingest_line(acc, d):
@@ -663,6 +737,13 @@ def ingest_line(acc, d):
             inp = b.get("input") or {}
             if b.get("name") == "Bash" and inp.get("run_in_background"):
                 acc["launches"][b["id"]] = when
+            if b.get("name") == "TaskStop":
+                # Pending until its result confirms it: a TaskStop that failed
+                # leaves the task running, and marking it ended on the call
+                # alone would reintroduce the bug in the other direction.
+                tid = (inp.get("task_id") or "").strip()
+                if tid:
+                    acc.setdefault("stops", {})[b["id"]] = tid
             if b.get("name") == "AskUserQuestion":
                 q = {"id": b["id"], "at": when, "outcome": "answered"}
                 acc["questions"].append(q)
@@ -682,6 +763,11 @@ def ingest_line(acc, d):
         msg = d.get("message") or {}
         c = msg.get("content")
         text = (_text_of(msg) or "").strip()
+        # Unconditional, unlike the denial scan below: these two facts arrive
+        # on ordinary successful results.
+        for b in c if isinstance(c, list) else []:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                _note_task_result(acc, b, when)
         if d.get("toolDenialKind"):
             acc["denials"].append({"kind": d["toolDenialKind"], "at": when})
             for b in c if isinstance(c, list) else []:
@@ -718,6 +804,7 @@ def state_from_accumulator(acc, prompt, at, session_id=None, cwd=None,
         questions=[dict(q, at=pt(q.get("at"))) for q in acc["questions"]],
         launches={k: pt(v) for k, v in acc["launches"].items()},
         notified={k: pt(v) for k, v in acc["notified"].items()},
+        ended={k: pt(v) for k, v in (acc.get("ended") or {}).items()},
         api_errors=[pt(a) for a in acc["api_errors"]],
         denials=[dict(x, at=pt(x.get("at"))) for x in acc["denials"]],
         resolver=resolver)
