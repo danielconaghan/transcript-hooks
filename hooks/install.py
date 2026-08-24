@@ -1,11 +1,30 @@
 #!/usr/bin/env python3
-"""Installer / uninstaller / corpus manager for the Context Churn Recorder.
+"""Installer / uninstaller / corpus manager for claude-resync.
 
-The recorder and its corpus live in a single global home, `~/.claude-transcripts`:
+Everything installed lives in one global home, `~/.claude-resync`:
 
-    ~/.claude-transcripts/
-        recorder.py          # the deployed hook entrypoint
-        corpus/              # the shared corpus (0700, gitignored)
+    ~/.claude-resync/
+        recorder.py          # capture hook entrypoint
+        intercept.py         # pre-send interception hook entrypoint
+        rules_engine.py      # shared triggers, imported by intercept.py
+        rules.json           # the rule catalogue (deployed copy)
+        corpus/              # raw captures (0700, gitignored)
+        refined/             # lossless reduction (0700, gitignored)
+        data/                # fires.jsonl, labels.jsonl, normalise.jsonl,
+                             # desync.jsonl, directive.jsonl, error logs
+        intercept-cache/     # per-session incremental state
+        .venv/               # the anthropic SDK, for API-drafted fixes
+        .env                 # ANTHROPIC_API_KEY (0600), never in the repo
+
+The source repo is canonical; this deploys from it. Hook commands reference
+$HOME/.claude-resync rather than a repo path, so moving or deleting the repo
+cannot break a live session.
+
+rules.json is the one file that flows BOTH ways: it is hand-edited and
+git-tracked in the repo, `research/backtest.py --write` updates the repo copy
+with measured precision, and install deploys it. `status` reports when the
+deployed copy has drifted from the repo so a stale catalogue is visible rather
+than silently in force.
 
 All captured data lands in that one global corpus regardless of which project
 triggered the hook. What varies is *which sessions get recorded*, controlled by
@@ -51,6 +70,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 
 # The six capture points, plus the tool-failure event (a distinct kind of churn
@@ -68,17 +88,39 @@ EVENTS = [
 ]
 
 # The recorder's global home. Kept in sync with recorder.transcripts_home().
-TRANSCRIPTS_HOME = os.path.join(os.path.expanduser("~"), ".claude-transcripts")
+TRANSCRIPTS_HOME = (os.environ.get("CLAUDE_RESYNC_HOME")
+                    or os.environ.get("CLAUDE_TRANSCRIPTS_HOME")
+                    or os.path.join(os.path.expanduser("~"), ".claude-resync"))
 
 # Substring that uniquely identifies a hook command as belonging to this
 # recorder. Used for idempotent install and for surgical uninstall.
-SENTINEL = ".claude-transcripts/recorder.py"
+# Substrings identifying a hook command as ours, for idempotent install and
+# surgical uninstall. Path-qualified rather than bare filenames so we never
+# strip an unrelated hook that happens to mention "recorder.py". Both the
+# current home and the pre-rename one are listed, so uninstall still works on
+# an install that predates the rename.
+SENTINELS = (
+    ".claude-resync/recorder.py",
+    ".claude-resync/intercept.py",
+    ".claude-transcripts/recorder.py",     # legacy
+    ".claude-transcripts/intercept.py",    # legacy
+)
+SENTINEL = SENTINELS[0]                    # retained for existing references
+SENTINEL_INTERCEPT = SENTINELS[1]
+
+
+def is_ours(command):
+    return isinstance(command, str) and any(x in command for x in SENTINELS)
 
 # The hook command. $HOME is expanded by the shell inside double quotes, so this
 # one form is portable across machines and works for both global and
 # project-scoped registration (the recorder is always deployed globally).
 def command_for(event):
-    return 'python3 "$HOME/.claude-transcripts/recorder.py" %s || true' % event
+    return 'python3 "$HOME/.claude-resync/recorder.py" %s || true' % event
+
+
+def intercept_command():
+    return 'python3 "$HOME/.claude-resync/intercept.py" || true'
 
 # Reserved buffer that Claude Code subtracts from the compaction window. A
 # window at or below this collapses the trigger threshold to zero and
@@ -144,9 +186,10 @@ def write_settings(path, data):
 
 
 def strip_our_hooks(settings):
-    """Remove every command hook that belongs to this recorder, pruning any
-    matcher-groups and event arrays we thereby empty. Returns count removed.
-    Leaves all non-recorder settings untouched."""
+    """Remove every command hook that belongs to us — capture AND interception,
+    current paths and pre-rename ones — pruning any matcher-groups and event
+    arrays we thereby empty. Returns count removed. Leaves everything else,
+    including other people's UserPromptSubmit hooks, untouched."""
     removed = 0
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
@@ -166,9 +209,7 @@ def strip_our_hooks(settings):
                 continue
             kept = []
             for cmd in cmds:
-                if (isinstance(cmd, dict)
-                        and isinstance(cmd.get("command"), str)
-                        and SENTINEL in cmd["command"]):
+                if isinstance(cmd, dict) and is_ours(cmd.get("command")):
                     removed += 1
                 else:
                     kept.append(cmd)
@@ -183,6 +224,23 @@ def strip_our_hooks(settings):
     if not hooks:
         del settings["hooks"]
     return removed
+
+
+def add_intercept_hook(settings):
+    """Register the pre-send interceptor. Separate from the recorder hooks: the
+    recorder is passive and always wanted, whereas interception changes what
+    Claude sees and a user may reasonably run one without the other."""
+    hooks = settings.setdefault("hooks", {})
+    groups = hooks.get("UserPromptSubmit") or []
+    kept = []
+    for g in groups:
+        inner = [h for h in (g.get("hooks") or [])
+                 if not is_ours(h.get("command"))]
+        if inner:
+            kept.append(dict(g, hooks=inner))
+    kept.append({"hooks": [{"type": "command", "command": intercept_command(),
+                            "timeout": 15}]})
+    hooks["UserPromptSubmit"] = kept
 
 
 def add_our_hooks(settings):
@@ -244,16 +302,138 @@ def check_local_shadow(cdir):
 # corpus helpers
 # --------------------------------------------------------------------------- #
 
-def deploy_recorder(dest_dir):
-    """Copy recorder.py from beside this installer into the target dir."""
-    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "recorder.py")
-    if not os.path.exists(src):
-        raise SystemExit("ERROR: recorder.py not found next to install.py (%s)." % src)
+# What gets deployed, and where it comes from. hooks/ holds the two hook
+# entrypoints; the engine and the catalogue live at the repo root because both
+# the hooks and the research scripts depend on them and neither owns them.
+RUNTIME_FILES = [
+    ("hooks/recorder.py", "recorder.py", 0o755),
+    ("hooks/intercept.py", "intercept.py", 0o755),
+    ("rules_engine.py", "rules_engine.py", 0o644),
+    ("rules.json", "rules.json", 0o644),
+]
+
+
+ENVFILE_TEMPLATE = """\
+# Credentials for claude-resync's API-drafted fixes.
+# Read by intercept.py because a hook does not inherit your shell's exports.
+# A real exported variable always wins over this file.
+#
+# ANTHROPIC_API_KEY=sk-ant-...
+#
+# Turn every outbound call off without editing the catalogue:
+# CLAUDE_RESYNC_API=0
+"""
+
+
+def venv_dir(dest_dir):
+    return os.path.join(dest_dir, ".venv")
+
+
+def venv_python(dest_dir):
+    return os.path.join(venv_dir(dest_dir), "bin", "python")
+
+
+def sdk_present(dest_dir):
+    """Whether intercept.py will be able to import anthropic.
+
+    Mirrors intercept.import_anthropic(): the interpreter version is part of the
+    path, so a venv built against another python does not count."""
+    site = os.path.join(venv_dir(dest_dir), "lib",
+                        "python%d.%d" % sys.version_info[:2], "site-packages")
+    return os.path.isdir(os.path.join(site, "anthropic"))
+
+
+def ensure_sdk(dest_dir):
+    """Create ~/.claude-resync/.venv and install the anthropic SDK.
+
+    A venv rather than the system python because homebrew's is PEP 668
+    externally-managed and refuses `pip install`. Best-effort by design: without
+    the SDK every API-drafted fix falls back to its template, so a machine with
+    no network still gets a working install. Returns a status string."""
+    if sdk_present(dest_dir):
+        return "already present"
+    try:
+        if not os.path.isdir(venv_dir(dest_dir)):
+            subprocess.run([sys.executable, "-m", "venv", venv_dir(dest_dir)],
+                           check=True, capture_output=True, timeout=120)
+        subprocess.run([os.path.join(venv_dir(dest_dir), "bin", "pip"),
+                        "install", "--quiet", "anthropic"],
+                       check=True, capture_output=True, timeout=300)
+    except FileNotFoundError:
+        return "SKIPPED (no venv/pip available)"
+    except subprocess.TimeoutExpired:
+        return "SKIPPED (timed out)"
+    except subprocess.CalledProcessError as exc:
+        tail = (exc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        return "SKIPPED (%s)" % (tail[-1][:70] if tail else "pip failed")
+    return "installed" if sdk_present(dest_dir) else "SKIPPED (import path mismatch)"
+
+
+def ensure_envfile(dest_dir):
+    """Write the .env template if absent. Never overwrites — it holds a key."""
+    p = os.path.join(dest_dir, ".env")
+    if os.path.exists(p):
+        return "exists (left alone)"
+    try:
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(ENVFILE_TEMPLATE)
+        os.chmod(p, 0o600)
+    except OSError as exc:
+        return "could not create: %s" % exc
+    return "created (add your key)"
+
+
+def repo_root():
+    """This installer lives in hooks/, so the repo is one level up."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def deploy_runtime(dest_dir):
+    """Copy the runtime from the repo into the global home.
+
+    Every hook entrypoint plus everything it imports, so a deployed install has
+    no dependency on the repo remaining in place. Returns the deployed paths."""
+    root = repo_root()
     os.makedirs(dest_dir, exist_ok=True)
-    dest = os.path.join(dest_dir, "recorder.py")
-    shutil.copyfile(src, dest)
-    os.chmod(dest, 0o755)
-    return dest
+    out = []
+    for rel, name, mode in RUNTIME_FILES:
+        src = os.path.join(root, rel)
+        if not os.path.exists(src):
+            raise SystemExit("ERROR: %s not found in the repo (%s)." % (rel, src))
+        dest = os.path.join(dest_dir, name)
+        shutil.copyfile(src, dest)
+        os.chmod(dest, mode)
+        out.append(dest)
+    for sub in ("data", "intercept-cache"):
+        d = os.path.join(dest_dir, sub)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+    return out
+
+
+def deploy_recorder(dest_dir):
+    """Retained name used by cmd_install; deploys the whole runtime now."""
+    return deploy_runtime(dest_dir)[0]
+
+
+def catalogue_drift(dest_dir):
+    """True when the deployed rules.json differs from the repo's. The repo copy
+    is canonical, so drift means the running catalogue is stale."""
+    import hashlib
+    def h(p):
+        try:
+            with open(p, "rb") as fh:
+                return hashlib.sha256(fh.read()).hexdigest()
+        except Exception:
+            return None
+    a = h(os.path.join(repo_root(), "rules.json"))
+    b = h(os.path.join(dest_dir, "rules.json"))
+    if a is None or b is None:
+        return None
+    return a != b
 
 
 def ensure_corpus(path):
@@ -307,6 +487,29 @@ def _iter_corpus_files(cpath):
 # subcommands
 # --------------------------------------------------------------------------- #
 
+def cmd_deploy(args):
+    """Copy the runtime into ~/.claude-resync and change nothing else.
+
+    `install` deploys too, but it also rewrites settings.json, strips and
+    re-adds every hook entry, and ensures the corpus, the .env and the SDK —
+    far too much to run after editing one rule. Without a deploy-only path the
+    temptation is to `cp` the four files by hand, and that is how the repo and
+    the runtime drift: a hand-copy misses a file, or skips the chmod that makes
+    intercept.py executable, and the hook goes on running the old code while
+    the repo looks correct.
+
+    The repo is the source of truth; this is the only sanctioned way to move it
+    into place."""
+    dest = recorder_dir()
+    deployed = deploy_runtime(dest)
+    print("runtime deployed from %s" % repo_root())
+    print("  to %s" % dest)
+    for d in deployed:
+        print("     %s" % os.path.basename(d))
+    print("\nsettings untouched. Use `install` to (re-)register hooks,")
+    print("and `intercept.py --status` to confirm what is live.")
+
+
 def cmd_install(args):
     project = args.project          # None => global registration
     is_global = project is None
@@ -318,15 +521,21 @@ def cmd_install(args):
         print("!! machine, across all projects (including their secrets).")
         print("!! Use --project PATH to restrict recording to one project.\n")
 
-    # 1. deploy the recorder + prepare the global corpus
-    dest = deploy_recorder(recorder_dir())
+    # 1. deploy the runtime + prepare the global corpus
+    deployed = deploy_runtime(recorder_dir())
+    dest = deployed[0]
     cpath = corpus_path()
     ensure_corpus(cpath)
+    env_state = ensure_envfile(recorder_dir())
+    sdk_state = ("SKIPPED (--no-sdk)" if args.no_sdk
+                 else ensure_sdk(recorder_dir()))
 
     # 2. merge hooks (strip-then-add makes this idempotent)
     settings = load_settings(spath)
     removed = strip_our_hooks(settings)
     add_our_hooks(settings)
+    if not args.no_intercept:
+        add_intercept_hook(settings)
 
     # 3. optional compaction window
     warnings = []
@@ -338,9 +547,16 @@ def cmd_install(args):
     write_settings(spath, settings)
 
     # 4. report
-    print("Context Churn Recorder installed.")
+    print("claude-resync installed.")
     print("  settings : %s" % spath)
-    print("  recorder : %s" % dest)
+    print("  runtime  : %s" % os.path.dirname(dest))
+    for d in deployed:
+        print("             %s" % os.path.basename(d))
+    print("  intercept: %s" % ("registered" if not args.no_intercept
+                               else "NOT registered (--no-intercept)"))
+    print("  sdk      : %s  (%s)" % (sdk_state, venv_dir(recorder_dir())))
+    print("  .env     : %s  (%s)"
+          % (env_state, os.path.join(recorder_dir(), ".env")))
     print("  corpus   : %s  (global, 0700, gitignored)" % cpath)
     print("  records  : %s" % ("ALL sessions on this machine"
                                if is_global else "sessions in %s" % os.path.abspath(project)))
@@ -389,6 +605,25 @@ def cmd_status(args):
         if isinstance(settings.get("env"), dict) else None
     print("Compaction window (CLAUDE_CODE_AUTO_COMPACT_WINDOW): %s"
           % (win if win else "unset (default)"))
+
+    ihooks = hooks.get("UserPromptSubmit", []) if isinstance(hooks, dict) else []
+    ifound = any(is_ours(c.get("command")) and "intercept.py" in (c.get("command") or "")
+                 for g in ihooks if isinstance(g, dict)
+                 for c in g.get("hooks", []) if isinstance(c, dict))
+    print("Pre-send interceptor:")
+    print("  [%s] UserPromptSubmit" % ("x" if ifound else " "))
+
+    rdir = recorder_dir()
+    drift = catalogue_drift(rdir)
+    print("  catalogue  : %s"
+          % ("DRIFTED from the repo — re-run install" if drift
+             else "in sync with the repo"))
+    print("  sdk        : %s" % ("present" if sdk_present(rdir)
+                                 else "missing — API fixes use templates"))
+    print("  .env       : %s" % ("present" if os.path.exists(
+        os.path.join(rdir, ".env")) else "absent"))
+    print("  (rule routing, fire and verdict counts: "
+          "python3 %s/intercept.py --status)" % rdir)
 
     cpath = corpus_path()
     sessions, snaps, total = _corpus_stats(cpath)
@@ -479,10 +714,21 @@ def build_parser():
 
     sp = sub.add_parser("install", help="install/refresh the recorder hooks")
     add_target(sp)
+    sp.add_argument("--no-intercept", action="store_true",
+                    help="deploy and register capture only, leaving the "
+                         "pre-send interceptor unregistered")
+    sp.add_argument("--no-sdk", action="store_true",
+                    help="skip creating .venv / installing the anthropic SDK. "
+                         "API-drafted fixes then fall back to templates")
     sp.add_argument("--window", type=int, default=None,
                     help="set CLAUDE_CODE_AUTO_COMPACT_WINDOW (>= %d; %d+ recommended)"
                          % (WINDOW_HARD_FLOOR, WINDOW_SAFE))
     sp.set_defaults(func=cmd_install)
+
+    sp = sub.add_parser(
+        "deploy", help="copy the runtime into ~/.claude-resync, touching no "
+                       "settings — use after editing rules.json or the engine")
+    sp.set_defaults(func=cmd_deploy)
 
     sp = sub.add_parser("uninstall", help="remove only the recorder hooks")
     add_target(sp)

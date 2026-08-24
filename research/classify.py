@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""Ask a model whether each message was a real desync.
+
+`gaps.py` decides that from six hand-written regexes over the message text.
+That cannot work, for a reason worth stating plainly: *"did the user have to
+correct us?"* is a question about the **previous turn**, and a regex over the
+message cannot see the previous turn. It can only spot vocabulary. Measured on
+the 50-session corpus it also produced obvious nonsense — both `scope-creep`
+hits were the phrase "out of scope" inside a spec Daniel pasted, and two
+`correction` hits were the platform's own compaction summary.
+
+Worse than the false positives is the recall: nobody knows how many desyncs the
+regexes miss, because you can only inspect what they matched.
+
+This sends each message plus the assistant turn before it to a model and asks
+the actual question. 433 of 483 messages have that preceding turn available.
+
+Reproducibility
+---------------
+
+An LLM pass is not reproducible, and `PLAN.md` bans a model from the *trigger*
+path for exactly that reason. This is the labelling path, not the trigger path
+— but the concern still applies, so verdicts are **cached to disk** keyed by a
+content hash. The pass runs once, results persist, and a re-run only spends
+money on messages it has not seen. After the first run the corpus figures are
+as reproducible as the hand labels are.
+
+Every row records the model that produced it. Nothing here is ground truth:
+spot-check a sample by hand before trusting a number that rests on it, and
+because the rows are tagged you can always recompute without them.
+
+    python3 classify.py --limit 40                    # pilot, cheap model
+    python3 classify.py --limit 40 --recheck          # ignore the cache
+    python3 classify.py --model claude-opus-5         # the pass you keep
+    python3 classify.py --compare                     # model vs the regexes
+    python3 classify.py --show                        # what is cached so far
+"""
+
+import argparse
+import collections
+import concurrent.futures
+import glob
+import hashlib
+import json
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+sys.path.insert(0, REPO)
+sys.path.insert(0, HERE)
+
+import rules_engine as E   # noqa: E402
+import backtest as B       # noqa: E402
+
+VERDICTS = os.path.join(B.resync_home(), "data", "desync.jsonl")
+DIRECTIVES = os.path.join(B.resync_home(), "data", "directive.jsonl")
+
+# Not labels.jsonl. That file is keyed on (rule, fire_key) and answers "was this
+# rule right about this fire". This answers "was this message a desync at all",
+# which is a different question about a different object, and mixing them would
+# let a message-level opinion masquerade as evidence about a rule.
+
+TUNING_MODEL = "claude-haiku-4-5"
+KEEPER_MODEL = "claude-opus-5"
+NO_EFFORT_MODELS = ("claude-haiku-4-5", "claude-sonnet-4-5", "claude-haiku-3")
+
+SYSTEM = """\
+You are auditing a developer's coding session with an AI assistant, to find \
+moments where the assistant had drifted out of sync with what the developer \
+actually wanted.
+
+You will be shown the assistant's previous turn, then the developer's next \
+message. Decide whether that message shows the assistant was out of sync.
+
+It IS a desync when the developer:
+  - corrects a fact the assistant was working from (a moved endpoint, a renamed
+    field, a wrong assumption)
+  - re-reports a symptom that was supposed to be fixed already
+  - asks whether work is actually progressing, because they cannot observe it:
+    "is it stuck?", "still running?", "why is this taking so long?". A question
+    about how something works, what an error means, or what the right approach
+    is, is NOT this — that is a developer thinking, not a developer blocked.
+  - points out the assistant did something other than what was asked
+  - asks for work to be undone or redone
+
+It is NOT a desync when the developer:
+  - gives a new instruction, or the next step in a plan, however it is worded.
+    "do it all over again" as a fresh request is not a desync; "still not
+    working" is.
+  - asks a question out of curiosity, or for an explanation
+  - pastes a specification, brief, or documentation. Such text often contains
+    words like "out of scope", "simpler" or "actually" as part of its content;
+    that is the document talking, not the developer complaining.
+  - reports a problem in their own environment they have just fixed themselves
+  - is answering a question the assistant asked
+
+Some inputs are not developer messages at all: a platform-generated conversation
+summary (often opening "This session is being continued from a previous
+conversation") is machine text. Return desync false, kind "none".
+
+Judge only what the message shows. Do not speculate about what might have gone
+wrong off-screen.
+
+Scoring your own certainty is part of the job, and the levels mean specific
+things. A pilot run returned "high" on every single desync it found, which is
+not credible on a task with genuinely borderline cases:
+
+  high    You can point to the exact claim or assumption in the assistant's
+          previous turn that this message contradicts. Put it in
+          `contradicts`. If you cannot fill that field, this is not high.
+  medium  It reads as a desync, but an innocent reading exists — it could be
+          read as the next instruction, or as the developer thinking aloud.
+  low     Genuinely ambiguous. You would not defend either answer.
+
+Most honest judgements are `medium`. `high` is for a contradiction you can
+quote. Spreading your answers across the three is not hedging; it is the only
+way the scores carry information.
+
+`kind` names the KIND OF DESYNC. If desync is false, kind must be "none" — do not reach for the closest-looking category. Most messages in a healthy session are not desyncs; "none" is the expected answer.
+
+`quote` must be copied verbatim from the developer's message, or be empty. A
+pilot dropped a letter from a URL it called a quote; copy, do not retype.
+
+`contradicts` must be copied verbatim from the ASSISTANT'S PREVIOUS TURN — the
+claim this message shows to be wrong. Leave it empty unless confidence is
+"high", and do not claim "high" without it.\
+"""
+
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "desync": {"type": "boolean"},
+        "kind": {"type": "string", "enum": [
+            "correction", "re-report", "state-question", "misread",
+            "scope", "undo", "none"]},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "quote": {"type": "string"},
+        # Verbatim from the assistant's previous turn. Required to be non-empty
+        # for confidence "high", which is what stops "high" being free: the
+        # model has to produce the contradicted claim, not just assert one
+        # exists. It also hands us the assert-vs-reality pair for nothing.
+        "contradicts": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+    "required": ["desync", "kind", "confidence", "quote", "contradicts",
+                 "reason"],
+    "additionalProperties": False,
+}
+
+
+DIRECTIVE_SYSTEM = """\
+You are analysing a developer's message to an AI coding assistant, to judge how \
+strongly it directs the assistant.
+
+A DIRECTIVE is anything that should change what the assistant does: an \
+instruction, a correction of a fact the assistant is working from, a report that \
+something is broken, or a statement of what the developer wants. A message can \
+be a directive without containing an imperative.
+
+Judge how the directive is DELIVERED, not how important it is:
+
+  direct     An unambiguous instruction or assertion. "please fix X",
+             "insights are no more", "open crm-launch is not serving".
+             Politeness markers — "please", "can you", "could you" — do NOT
+             weaken a directive. In this register they are ordinary and carry
+             full force. Never mark a message weakened merely for being polite.
+             Nor does stating a WANT: "I would like X", "I need X", "I want X"
+             name the outcome required and are `direct`. Wanting a thing is not
+             being unsure of it.
+  weakened   The force is reduced by how it is phrased, so a reader could take
+             it as optional, as curiosity, or as an open question when it is
+             not. Set EVERY form that applies — these overlap constantly and a
+             message is often two or three at once:
+
+             `hedged` — the developer's CERTAINTY is presented as lower than it
+             is: "i think", "i believe", "looks like", "not sure", "i thought",
+             "maybe". This is about confidence in a claim, and it is what
+             separates a hedge from a want: "I would like X" is direct, but "I
+             believe X is wrong" hedges the claim that X is wrong.
+
+             `understated` — the SIGNIFICANCE is downplayed. This is about
+             scale, not vocabulary, and it is the easiest one to miss. Judge the
+             gap between how big the thing is and how small it is made to sound:
+               "I'm a little confused we should be able to one-to-one replay org
+                service with crm service" — a fundamental architecture mismatch,
+                called mild confusion
+               "finances are handled a bit differently" — materially different
+               "I would prefer a please," — a reprimand delivered as taste
+               "this previously worked, the only thing we really changed is the
+                DB seeding" — names the cause of a total breakage as a detail
+             A genuinely small problem described as small is NOT understatement.
+             The tell is a serious consequence wrapped in mild language.
+
+             `interrogative` — an assertion or instruction delivered as a
+             question. Includes rhetorical questions and claims embedded in
+             questions: "should it be taking this long?", "Are you aware that v4
+             and v5 have different microservices?", "the monthly ones haven't
+             run in the last month, so i think they should be run as well?"
+
+             `optative` — the OPTIONALITY is in the verb. The developer names
+             what he wants done and then offers it as something to weigh rather
+             than to do, so a reader can satisfy the message by thinking about
+             it: "consider", "have a think about", "might be worth", "it may be
+             worth looking at", "you could", "one option is", "perhaps we
+             should", "it would be nice if", "at some point".
+               "one preventative action I would like you to consider ... both
+                of these weaken a directive" — proposes an entire rule class,
+                framed as something to consider
+               "might be worth checking the seeding order" — an instruction to
+                check it
+             Distinct from `hedged`: the developer is not unsure of the CLAIM,
+             he has made the ACTION optional. "I would like you to consider X"
+             is optative even though "I would like X" would be direct — the
+             want is firm, the doing is not. Also distinct from a genuine
+             open question: an optative names the thing to be done, an open
+             question asks what should be done.
+  none       Not a directive at all. Reserve this for a message that seeks
+             information and asserts nothing: "where is login?", "what does
+             ./do down stop?". Also an answer to something the assistant asked,
+             or pasted reference material.
+
+`none` is over-used. Before choosing it, check for these, which ARE directives:
+
+  * A report that something is broken or still broken. "still getting a 500 on
+    /clients/HNW" names no action but demands one — it is `direct`.
+  * A claim embedded in a question. "what does admin send to org, crm is a new
+    version of org, would that matter?" contains the correction "crm is a new
+    version of org". The question is the wrapper; the correction is the
+    payload. That is `weakened` / `interrogative`, and it is the single most
+    important case to get right.
+  * A preference stated as an observation. "it worked literally today before we
+    ran the full delete" is a report that the change broke it.
+  * Something offered for consideration. "one thing worth considering is that
+    the seeding runs twice" is a directive — he named the thing and expects it
+    acted on. `weakened` / `optative`, never `none`.
+
+The distinction that matters is whether a reader could reasonably UNDER-WEIGHT
+it — treat a correction as curiosity, an instruction as an open question, or a
+required change as an optional one.
+
+`content` is a short paraphrase of what the developer wants done or believed,
+under 15 words. Empty only when strength is "none".
+
+Scoring your own certainty is part of the job. A pilot returned "high" on 12 of
+12, which is not credible:
+
+  high    The delivery is unambiguous and you could defend it to someone
+          reading the same message.
+  medium  It could be read either way — a report or a passing remark, an
+          instruction or a musing. Most honest judgements are here.
+  low     Genuinely ambiguous. You would not defend either answer.
+
+Politeness and indirectness saturate this corpus: "please", "can you", "would
+you mind" are the normal register and carry FULL force. Their presence alone
+must never push you to "weakened". What makes something weakened is that the
+claim or instruction is buried, softened by uncertainty it does not really
+have, made smaller than it is, or made optional when it is not.
+
+Do not let the politeness rule swallow the other forms. It is narrow: it covers
+"please", "can you", "could you", "would you mind" and stating a want. It does
+NOT license reading "I would like you to consider", "I believe", "maybe" or
+"might be worth" as mere courtesy — those reduce certainty or optionality, and
+that is weakening whatever register they arrive in.
+
+ONE HARD CONSTRAINT, and it is not optional. `hedged`, `understated`,
+`interrogative` and `optative` are not independent annotations. They are the
+four ways a directive can be WEAKENED, so:
+
+  * If any of the four is true, `strength` MUST be "weakened".
+  * If `strength` is "direct" or "none", all four MUST be false.
+
+Setting a flag while choosing "direct" or "none" is self-contradictory and the
+row is discarded. So if you are about to do it, your `strength` is what is
+wrong: go back and set it to "weakened". The one exception to watch is a plain
+information-seeking question — "where is login?" is grammatically a question but
+asserts nothing, so it is `none` with `interrogative` FALSE. The flag marks a
+directive wearing a question, not any question.\
+"""
+
+DIRECTIVE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "is_directive": {"type": "boolean"},
+        "strength": {"type": "string", "enum": ["direct", "weakened", "none"]},
+        # Three independent flags, not one enum. As a single choice `hedge`
+        # absorbed every understated message — "I'm a little confused we should
+        # be able to one-to-one replay org service with crm service" is both,
+        # and the model could only say one, so `understatement` came back 0 of
+        # 448. These forms overlap constantly; forcing a winner destroyed the
+        # category that mattered most.
+        "hedged": {"type": "boolean"},
+        "understated": {"type": "boolean"},
+        "interrogative": {"type": "boolean"},
+        # Added after a demonstrated false negative: "one preventative action I
+        # would like you to consider ..." came back direct/high, and the reason
+        # field named "I would like" as a politeness marker carrying full force
+        # — the politeness rule had absorbed the hedge list, which contained
+        # "i would like to". The verb, not the courtesy, is what makes this
+        # weak, and the taxonomy had no name for it. Opus read the same message
+        # as weakened/hedged under the old prompt, so the flag exists to give
+        # the smaller model a category rather than to teach the larger one.
+        "optative": {"type": "boolean"},
+        "content": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["is_directive", "strength", "hedged", "understated",
+                 "interrogative", "optative", "content", "confidence",
+                 "reason"],
+    "additionalProperties": False,
+}
+
+# Two orthogonal questions about the same messages, kept in separate files for
+# the same reason desync verdicts stay out of labels.jsonl: a judgement about
+# one thing must never be able to masquerade as evidence about another.
+JUDGEMENTS = {
+    "desync":    {"path": VERDICTS,   "system": SYSTEM,
+                  "schema": SCHEMA},
+    "directive": {"path": DIRECTIVES, "system": DIRECTIVE_SYSTEM,
+                  "schema": DIRECTIVE_SCHEMA},
+}
+
+# Defined in backtest so both sides hash identically — a verdict written here
+# has to be findable by the replay that consumes it, and two copies of a hash
+# function is exactly how that quietly stops being true.
+msg_key = B.msg_key
+
+
+def collect(limit=None):
+    """(key, session, prior_assistant_turn, message_text) oldest first.
+
+    Compaction summaries are deliberately NOT filtered out: they are currently
+    ingested as human messages (a recorded open gap), and whether the model
+    rejects them is a useful check on the prompt."""
+    groups = collections.defaultdict(list)
+    for p in (glob.glob(B.REFINED + "/*.epoch*.jsonl")
+              + glob.glob(B.REFINED + "/*.inflight.*.jsonl")):
+        sid = os.path.basename(p).split(".epoch")[0].split(".inflight")[0]
+        groups[sid].append(p)
+
+    out = []
+    for sid in sorted(groups):
+        prior = ""
+        for d in B.load_session_events(sid, groups[sid]):
+            t = d.get("type")
+            if t == "assistant":
+                blocks = (d.get("message") or {}).get("content") or []
+                txt = " ".join(b.get("text", "") for b in blocks
+                               if isinstance(b, dict) and b.get("type") == "text")
+                if txt.strip():
+                    prior = txt
+            elif t == "user" and not d.get("isMeta"):
+                text = (B.msg_text(d) or "").strip()
+                if not text or B.SYS_PREFIX.match(text) or B.INTERRUPT.match(text):
+                    continue
+                out.append((msg_key(sid, text), sid, prior, text))
+    if limit:
+        # Spread the sample across sessions rather than taking one session's
+        # worth: a pilot that only sees the tail of the corpus tells you nothing
+        # about the rest of it.
+        step = max(1, len(out) // limit)
+        out = out[::step][:limit]
+    return out
+
+
+def load_cache(path=None):
+    got = {}
+    path = path or VERDICTS
+    if not os.path.exists(path):
+        return got
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("key"):
+                got[d["key"]] = d       # last write wins
+    return got
+
+
+def append(rows, path=None):
+    if not rows:
+        return
+    path = path or VERDICTS
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+    os.chmod(path, 0o600)
+
+
+def classify_one(client, model, item, judgement="desync"):
+    spec = JUDGEMENTS[judgement]
+    key, sid, prior, text = item
+    user = ("ASSISTANT'S PREVIOUS TURN:\n%s\n\n"
+            "DEVELOPER'S MESSAGE:\n%s"
+            % ((prior[:3000] or "(nothing — this is the first message)"),
+               text[:3000]))
+    fmt = {"format": {"type": "json_schema", "schema": spec["schema"]}}
+    if not model.startswith(NO_EFFORT_MODELS):
+        fmt["effort"] = "low"
+    resp = client.messages.create(
+        model=model, max_tokens=1000, system=spec["system"],
+        messages=[{"role": "user", "content": user}], output_config=fmt)
+    if resp.stop_reason == "refusal":
+        raise RuntimeError("refused")
+    blob = next(b.text for b in resp.content if getattr(b, "type", None) == "text")
+    data = json.loads(blob)
+    data.update({"key": key, "session": sid, "model": model,
+                 "text": " ".join(text.split())[:300]})
+    return data
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--limit", type=int, default=None,
+                    help="classify only N messages, spread across sessions")
+    ap.add_argument("--model", default=TUNING_MODEL,
+                    help="default %s; use %s for the pass you keep"
+                         % (TUNING_MODEL, KEEPER_MODEL))
+    ap.add_argument("--recheck", action="store_true",
+                    help="re-classify even if a verdict is cached")
+    ap.add_argument("--compare", action="store_true",
+                    help="compare cached verdicts against gaps.py's regexes")
+    ap.add_argument("--show", action="store_true", help="print cached verdicts")
+    ap.add_argument("--judge", choices=sorted(JUDGEMENTS), default="desync",
+                    help="which judgement to make: 'desync' (was this message "
+                         "where a desync surfaced) or 'directive' (is it a "
+                         "directive, and is its force weakened). Separate "
+                         "files, separate questions")
+    ap.add_argument("--workers", type=int, default=6)
+    args = ap.parse_args(argv)
+    spec = JUDGEMENTS[args.judge]
+
+    cache = load_cache(spec['path'])
+
+    if args.show or args.compare:
+        if not cache:
+            print("nothing cached yet — run without --show first")
+            return 1
+        if args.show:
+            for d in cache.values():
+                print("%-6s %-14s %-8s %s" % (
+                    "DESYNC" if d.get("desync") else "-", d.get("kind"),
+                    d.get("confidence"), d.get("text", "")[:78]))
+        if args.compare:
+            import gaps as G
+            agree = collections.Counter()
+            disagree = []
+            for d in cache.values():
+                rx_hit = any(rx.search(d.get("text") or "")
+                             for rx in G.SIGNALS.values())
+                m_hit = bool(d.get("desync"))
+                agree[(m_hit, rx_hit)] += 1
+                if m_hit != rx_hit:
+                    disagree.append((m_hit, d))
+            n = sum(agree.values())
+            same = agree[(True, True)] + agree[(False, False)]
+            print("\nmodel vs regex over %d cached message(s): agree on %d (%.0f%%)"
+                  % (n, same, 100.0 * same / n if n else 0))
+            print("  both say desync      : %d" % agree[(True, True)])
+            print("  both say no          : %d" % agree[(False, False)])
+            print("  model yes, regex no  : %d   <- regex MISSED these"
+                  % agree[(True, False)])
+            print("  regex yes, model no  : %d   <- regex FALSE POSITIVES"
+                  % agree[(False, True)])
+            for m_hit, d in disagree[:12]:
+                print("\n  %s  [%s/%s] %s" % (
+                    "regex missed" if m_hit else "regex false positive",
+                    d.get("kind"), d.get("confidence"), d.get("text", "")[:74]))
+                print("      %s" % (d.get("reason") or "")[:96])
+        return 0
+
+    items = collect(args.limit)
+    todo = [i for i in items if args.recheck or i[0] not in cache]
+    print("%d message(s) selected, %d already cached, %d to classify with %s"
+          % (len(items), len(items) - len(todo), len(todo), args.model))
+    if not todo:
+        return 0
+
+    sys.path.insert(0, os.path.join(B.resync_home()))
+    import intercept as I           # reuse its venv + .env resolution
+    anthropic = I.import_anthropic()
+    if anthropic is None:
+        print("anthropic SDK not importable — %s/.venv" % B.resync_home())
+        return 1
+    I.load_env_file()
+    client = anthropic.Anthropic()
+
+    rows, errors = [], collections.Counter()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = {ex.submit(classify_one, client, args.model, it, args.judge): it
+                for it in todo}
+        for n, fut in enumerate(concurrent.futures.as_completed(futs), 1):
+            try:
+                rows.append(fut.result())
+            except Exception as exc:
+                errors[type(exc).__name__] += 1
+            if n % 10 == 0 or n == len(todo):
+                print("  %d/%d" % (n, len(todo)))
+    append(rows, spec["path"])
+    print("\nwrote %d verdict(s) -> %s" % (len(rows), spec["path"]))
+    if errors:
+        print("errors: %s" % dict(errors))
+    if args.judge == "desync":
+        d = collections.Counter((r["desync"], r["kind"]) for r in rows)
+        print("\n%-8s %-14s %s" % ("desync", "kind", "count"))
+        for (yes, kind), c in d.most_common():
+            print("%-8s %-14s %d" % ("yes" if yes else "no", kind, c))
+        print("\nnext: --compare to see where this disagrees with the regexes")
+    else:
+        d = collections.Counter(r["strength"] for r in rows)
+        print("\n%-10s %s" % ("strength", "count"))
+        for st, c in d.most_common():
+            print("%-10s %d" % (st, c))
+        print("\nforms (independent, so they overlap):")
+        for f in ("hedged", "understated", "interrogative", "optative"):
+            n = sum(1 for r in rows if r.get(f))
+            print("   %-14s %d" % (f, n))
+        combos = collections.Counter(
+            tuple(f for f in ("hedged", "understated", "interrogative",
+                                  "optative")
+                  if r.get(f)) for r in rows if r["strength"] == "weakened")
+        print("\ncombinations among weakened:")
+        for c, n in combos.most_common():
+            print("   %-34s %d" % ("+".join(c) or "(none flagged)", n))
+        conf = collections.Counter(r["confidence"] for r in rows)
+        print("\nconfidence: %s" % dict(conf))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

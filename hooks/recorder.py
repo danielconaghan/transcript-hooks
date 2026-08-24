@@ -64,13 +64,30 @@ KNOWN_EVENTS = frozenset({
 
 
 def transcripts_home():
-    """The recorder's global home directory, `~/.claude-transcripts` by default.
+    """The global home for everything installed, `~/.claude-resync` by default.
 
     A single global store is used deliberately: the corpus is shared across
     every project/session on the machine, independent of where the hooks are
-    registered. Override with $CLAUDE_TRANSCRIPTS_HOME (used by tests)."""
-    return (os.environ.get("CLAUDE_TRANSCRIPTS_HOME")
-            or os.path.join(os.path.expanduser("~"), ".claude-transcripts"))
+    registered. It also holds the deployed scripts, the rule catalogue and the
+    runtime data, so the whole runtime is one directory and does not depend on
+    where the source repo happens to live.
+
+    Resolution order is deliberate. $CLAUDE_RESYNC_HOME wins so a test run can
+    be pointed elsewhere. $CLAUDE_TRANSCRIPTS_HOME is still honoured because it
+    was the variable before the project was renamed and may still be set in a
+    shell profile. Then the current default. Finally the pre-rename directory,
+    but only if it actually exists — an installation predating the rename keeps
+    recording into its existing corpus rather than silently starting a second,
+    empty one somewhere else."""
+    env = (os.environ.get("CLAUDE_RESYNC_HOME")
+           or os.environ.get("CLAUDE_TRANSCRIPTS_HOME"))
+    if env:
+        return env
+    new = os.path.join(os.path.expanduser("~"), ".claude-resync")
+    if os.path.isdir(new):
+        return new
+    legacy = os.path.join(os.path.expanduser("~"), ".claude-transcripts")
+    return legacy if os.path.isdir(legacy) else new
 
 
 def corpus_dir():
