@@ -487,6 +487,29 @@ def _iter_corpus_files(cpath):
 # subcommands
 # --------------------------------------------------------------------------- #
 
+def cmd_deploy(args):
+    """Copy the runtime into ~/.claude-resync and change nothing else.
+
+    `install` deploys too, but it also rewrites settings.json, strips and
+    re-adds every hook entry, and ensures the corpus, the .env and the SDK —
+    far too much to run after editing one rule. Without a deploy-only path the
+    temptation is to `cp` the four files by hand, and that is how the repo and
+    the runtime drift: a hand-copy misses a file, or skips the chmod that makes
+    intercept.py executable, and the hook goes on running the old code while
+    the repo looks correct.
+
+    The repo is the source of truth; this is the only sanctioned way to move it
+    into place."""
+    dest = recorder_dir()
+    deployed = deploy_runtime(dest)
+    print("runtime deployed from %s" % repo_root())
+    print("  to %s" % dest)
+    for d in deployed:
+        print("     %s" % os.path.basename(d))
+    print("\nsettings untouched. Use `install` to (re-)register hooks,")
+    print("and `intercept.py --status` to confirm what is live.")
+
+
 def cmd_install(args):
     project = args.project          # None => global registration
     is_global = project is None
@@ -701,6 +724,11 @@ def build_parser():
                     help="set CLAUDE_CODE_AUTO_COMPACT_WINDOW (>= %d; %d+ recommended)"
                          % (WINDOW_HARD_FLOOR, WINDOW_SAFE))
     sp.set_defaults(func=cmd_install)
+
+    sp = sub.add_parser(
+        "deploy", help="copy the runtime into ~/.claude-resync, touching no "
+                       "settings — use after editing rules.json or the engine")
+    sp.set_defaults(func=cmd_deploy)
 
     sp = sub.add_parser("uninstall", help="remove only the recorder hooks")
     add_target(sp)
