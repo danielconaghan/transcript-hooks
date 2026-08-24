@@ -150,6 +150,10 @@ ERRLOG = os.path.join(DATA_DIR, "intercept-errors.log")
 # answerable rather than a matter of opinion: latency paid, and whether it had
 # anything to say.
 NORMALISE_LOG = os.path.join(DATA_DIR, "normalise.jsonl")
+# Desyncs you called out yourself, via /ds. The only source of the two things
+# a transcript cannot yield: a desync that produced no visible correction, and
+# what the right answer actually was.
+MARKERS = os.path.join(DATA_DIR, "markers.jsonl")
 # Credentials for the API-drafted fixes. Outside the repo, 0600. A hook does
 # not see your shell's exports, so this file is how a key reaches it.
 ENVFILE = os.path.join(HOME_DIR, ".env")
@@ -1131,6 +1135,157 @@ def run_hook(payload, dry_run=False):
     }
 
 
+RE_BACK = re.compile(r"^-?(\d+)$")
+
+
+def live_transcript():
+    """The transcript being written right now: newest mtime under
+    ~/.claude/projects. There is no ambient session id for a CLI run from a
+    slash command, and guessing one is worse than deriving it — the file also
+    carries the message uuids the backwalk needs, which no argument could."""
+    root = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    best, best_mt = None, -1.0
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            if not f.endswith(".jsonl"):
+                continue
+            fp = os.path.join(dirpath, f)
+            try:
+                mt = os.path.getmtime(fp)
+            except OSError:
+                continue
+            if mt > best_mt:
+                best, best_mt = fp, mt
+    return best
+
+
+def _human_turns(path, keep=40):
+    """The last `keep` messages you actually typed, oldest first.
+
+    Same three filters the engine uses (isMeta, SYS_PREFIX, INTERRUPT), for the
+    same reason: a /ds anchored on a system-generated user line would point the
+    backwalk at something you never wrote. A slash command invocation is
+    already excluded by SYS_PREFIX's `command-name`, so /ds cannot anchor on
+    itself."""
+    out = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("type") != "user" or d.get("isMeta"):
+                    continue
+                msg = d.get("message") or {}
+                c = msg.get("content")
+                if isinstance(c, str):
+                    text = c
+                else:
+                    text = " ".join(b.get("text", "") for b in c or []
+                                    if isinstance(b, dict)
+                                    and b.get("type") == "text")
+                text = (text or "").strip()
+                if not text or SYS_PREFIX.match(text) or INTERRUPT.match(text):
+                    continue
+                out.append({"uuid": d.get("uuid"), "at": d.get("timestamp"),
+                            "text": text[:200], "sid": d.get("sessionId"),
+                            "cwd": d.get("cwd")})
+                out = out[-keep:]
+    except Exception as exc:
+        log_error("markers: transcript read failed: %r" % (exc,))
+    return out
+
+
+def do_mark_desync(raw, transcript=None):
+    """Record a desync you spotted, from `/ds [-N] <note>`.
+
+    A retrospective marker, deliberately: it is ground truth and never a
+    trigger. Two things a transcript cannot give up, and this can. One is a
+    desync that produced no visible correction — every marker the model finds
+    is one you wrote a correction for, so the silent ones leave no trace at
+    all. The other is what the RIGHT answer was, which is what turns a marker
+    into a candidate preventative action rather than a complaint.
+
+    -N is how many of your messages back the divergence started, because the
+    note lands at T and the backwalk needs T-n. Everything else is derived: a
+    figure you would have to reconstruct is a figure that will be wrong.
+
+    `transcript` overrides the newest-mtime guess. Needed to test this without
+    writing a fake marker, and useful when the session you mean is not the one
+    that last wrote to disk."""
+    raw = (raw or "").strip()
+    back = 0
+    if raw:
+        first, _, rest = raw.partition(" ")
+        m = RE_BACK.match(first)
+        if m:
+            back, raw = int(m.group(1)), rest.strip()
+    if not raw:
+        print("usage: /ds [-N] <what went wrong, and what the right answer was>")
+        print("  -N   how many of your messages back it started (default 0,")
+        print("       meaning this turn). /ds -3 the container path assumption")
+        print("a marker with no note is not evidence, so this is refused.")
+        return 2
+
+    path = transcript or live_transcript()
+    if not path:
+        print("no transcript found under ~/.claude/projects — nothing to anchor to")
+        return 1
+    turns = _human_turns(path)
+    if not turns:
+        print("no messages of yours found in %s" % path)
+        return 1
+
+    at = turns[-1]
+    idx = max(0, len(turns) - 1 - back)
+    frm = turns[idx]
+    if back and idx == 0 and len(turns) - 1 < back:
+        print("note: only %d message(s) of yours are in this transcript, so the "
+              "anchor is the earliest one rather than %d back."
+              % (len(turns), back))
+
+    spanned = None
+    try:
+        spanned = round((_ts(at["at"]) - _ts(frm["at"])).total_seconds())
+    except Exception:
+        pass
+
+    row = {
+        "ts": _iso(_now()), "source": "slash-command",
+        "session_id": at.get("sid"), "cwd": at.get("cwd"),
+        # `back` is what you asked for; `spanned_msgs` is what the transcript
+        # could actually give. They differ when the divergence predates the
+        # messages on hand, and conflating them would overstate the span.
+        "note": raw, "back": back,
+        "at_uuid": at.get("uuid"), "at_ts": at.get("at"),
+        "at_text": at.get("text"),
+        "from_uuid": frm.get("uuid"), "from_ts": frm.get("at"),
+        "from_text": frm.get("text"),
+        "spanned_msgs": (len(turns) - 1) - idx, "spanned_s": spanned,
+        "transcript": path,
+    }
+    _append_jsonl(MARKERS, [row], "markers")
+    n = sum(1 for _ in open(MARKERS, errors="replace")) if os.path.exists(MARKERS) else 1
+    actual = (len(turns) - 1) - idx
+    span = ("%d msg(s), %s" % (actual, _human_span(spanned))) if actual else "this turn"
+    print("desync recorded (%s) — %d in %s" % (span, n, MARKERS))
+    return 0
+
+
+def _human_span(secs):
+    if secs is None:
+        return "duration unknown"
+    if secs < 90:
+        return "%ds" % secs
+    if secs < 5400:
+        return "%dm" % round(secs / 60.0)
+    return "%.1fh" % (secs / 3600.0)
+
+
 def _append_jsonl(path, records, what):
     if not records:
         return
@@ -1563,8 +1718,17 @@ def main(argv=None):
                     help="with --normalise-log, include skipped invocations")
     ap.add_argument("--rule", default=None,
                     help="with --recent, restrict to this rule id")
+    ap.add_argument("--transcript", default=None,
+                    help="with --mark-desync: anchor to this transcript "
+                         "instead of the most recently written one")
+    ap.add_argument("--mark-desync", metavar="ARGS", default=None,
+                    help="record a desync you spotted: the raw /ds arguments, "
+                         "'[-N] <note>'. N is how many of your messages back "
+                         "it started")
     args = ap.parse_args(argv)
 
+    if args.mark_desync is not None:
+        return do_mark_desync(args.mark_desync, args.transcript)
     if args.install:
         return do_install(remove=False)
     if args.uninstall:
