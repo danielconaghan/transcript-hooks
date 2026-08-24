@@ -684,6 +684,12 @@ or an instruction as mere curiosity and fail to act on it.
 Write one or two sentences addressed to the ASSISTANT, restating what the \
 developer is actually asking for or asserting, at full force.
 
+Two parties, named the same way every time. "You" is the assistant and \
+nothing else — never the developer, and never replaced by "me" or "I". The \
+person who sent the message is "the developer" — never "you". Never use he, \
+she, him, her, his or hers: a message does not tell you the sender's gender, \
+and it has no bearing on the restatement.
+
 Rules, in order of importance:
 
 1. Restore FORCE, never CONFIDENCE — the one rule that must not be broken.
@@ -691,19 +697,39 @@ Rules, in order of importance:
    is true. Raise the first, never the second.
      Given "i think the Useful URLs are incorrect, now":
        WRONG  "The Useful URLs need updating because they are now incorrect."
-              (asserts as fact what he offered as a belief)
-       RIGHT  "His message functions as an instruction: he believes the Useful
-              URLs are now incorrect and wants them checked."
-   Attribute the belief to him. Never state it as established. Putting words in
-   his mouth is worse than leaving the hedge alone.
-2. Be respectful. Never characterise the developer or his communication — not
+              (asserts as fact what the developer offered as a belief)
+       RIGHT  "This functions as an instruction: the developer believes the
+              Useful URLs are now incorrect and wants you to check them."
+   Note the shape of the RIGHT line as well as its content: the developer in
+   the third person, the assistant as "you". That is the shape every
+   restatement takes.
+   Attribute the belief to the developer. Never state it as established.
+   Putting words in the developer's mouth is worse than leaving the hedge
+   alone.
+2. Be respectful. Never characterise the developer or the message — not
    unclear, not indirect, not frustrated, not annoyed, not telling you off.
    Describe the message, never the person.
-3. Politeness is not noise. "please", "can you", "would you mind" are his
-   normal register and carry full force. Never present removing them as a
-   correction, and never treat their presence as weakening.
+3. Politeness is not noise. "please", "can you", "would you mind" are the
+   developer's normal register and carry full force. Never present removing
+   them as a correction, and never treat their presence as weakening.
 4. Never fabricate a quote. Paraphrase, or quote verbatim.
-5. Address the assistant, never the developer. No imperatives aimed at him.
+5. Address the assistant, never the developer. This is the rule most often
+   broken, so it gets examples too. Summarising a request as "you want X" is
+   idiomatic English and completely wrong here, because it makes the developer
+   the addressee:
+     Given "I wonder if the SEO is any good.. can you give it a healthcheck
+     score (don't change naything)":
+       WRONG  "You want a search and SEO healthcheck of the site, without
+              making any changes."          ("you" is the developer)
+       WRONG  "You want me to run a healthcheck."
+                                            (same inversion, assistant as "me")
+       WRONG  "You want the assistant to audit the site."
+                                            (same inversion, third person)
+       RIGHT  "The developer wants you to run a search and SEO healthcheck of
+              the site and to report a score, and to change nothing while
+              doing it."
+   Whenever the sentence describes what the developer wants, the developer is
+   the SUBJECT of it and you are the one being asked.
 6. Be brief and plain. No preamble, no restating these rules.
 
 Reply with exactly SKIP — adding nothing else — whenever there is no weakening \
