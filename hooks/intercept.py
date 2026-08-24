@@ -730,35 +730,66 @@ def normalise_enabled():
             not in FALSY_ENV)
 
 
+def _norm_timing(total_t0, setup_ms=0.0, request_ms=0.0):
+    return {"total_ms": round((time.monotonic() - total_t0) * 1000, 1),
+            "setup_ms": round(setup_ms, 1),
+            "request_ms": round(request_ms, 1)}
+
+
 def normalise(prompt, cache=None):
-    """Restate a weakened directive at full force. Returns (text, status, ms).
+    """Restate a weakened directive at full force.
+
+    Returns (text, status, timing), where timing splits the elapsed time into
+    `setup_ms` and `request_ms`.
+
+    The split is not decoration. One timer starting at function entry charged
+    the SDK import and the .env read to the model, which is how `--status` came
+    to report a p95 of 10s against a request the SDK is given 4.0s to make —
+    two figures that cannot both describe the same call. The tell was R03, a
+    rule that makes no request at all, logging 9-13s in those same messages.
+    Since the whole keep-or-drop argument for this layer rests on what it costs
+    per message, the number has to say WHICH part is expensive: a slow import
+    is fixed by importing once, a slow model by choosing another.
 
     text is None when there is nothing to say, which is the common case."""
     t0 = time.monotonic()
     if not normalise_enabled():
-        return None, "off", 0.0
+        return None, "off", _norm_timing(t0)
     if len((prompt or "").strip()) < 15:
-        return None, "too-short", 0.0
+        return None, "too-short", _norm_timing(t0)
     key = _sha_text(prompt)
     if cache is not None and key in cache.normalised:
-        return (cache.normalised[key] or None), "cached", 0.0
+        return (cache.normalised[key] or None), "cached", _norm_timing(t0)
     if cache is not None and cache.norm_fails >= NORMALISE_MAX_FAILS:
-        return None, "circuit-open", 0.0
+        return None, "circuit-open", _norm_timing(t0)
 
+    # Setup: the venv path append plus `import anthropic`, then the .env read.
+    # Paid in full on the first message of a session and largely cached by the
+    # OS afterwards, which is exactly why it must not be averaged into the
+    # request figure.
+    t_setup = time.monotonic()
     anthropic = import_anthropic()
     if anthropic is None:
-        return None, "sdk-missing", 0.0
+        return None, "sdk-missing", _norm_timing(t0)
     load_env_file()
+    setup_ms = (time.monotonic() - t_setup) * 1000
+    # t_req is a sentinel, not just a stopwatch: on a timeout the request has
+    # spent the whole budget and reporting it as 0ms is exactly the kind of
+    # misattribution the split exists to remove.
+    t_req = None
+    request_ms = 0.0
     try:
         client = anthropic.Anthropic()
+        t_req = time.monotonic()
         resp = client.with_options(
             timeout=NORMALISE_TIMEOUT_S, max_retries=0).messages.create(
                 model=NORMALISE_MODEL, max_tokens=NORMALISE_MAX_TOKENS,
                 system=NORMALISE_SYSTEM,
                 messages=[{"role": "user", "content": prompt[:4000]}])
-        ms = round((time.monotonic() - t0) * 1000, 1)
+        request_ms = (time.monotonic() - t_req) * 1000
+        timing = _norm_timing(t0, setup_ms, request_ms)
         if resp.stop_reason == "refusal":
-            return None, "refusal", ms
+            return None, "refusal", timing
         text = " ".join(b.text for b in resp.content
                         if getattr(b, "type", None) == "text").strip()
         if cache is not None:
@@ -766,15 +797,17 @@ def normalise(prompt, cache=None):
         if not text or text.rstrip(".").upper() == "SKIP":
             if cache is not None:
                 cache.normalised[key] = ""      # remember the silence too
-            return None, "skip", ms
+            return None, "skip", timing
         if cache is not None:
             cache.normalised[key] = text
-        return text, "restated", ms
+        return text, "restated", timing
     except Exception as exc:
         if cache is not None:
             cache.norm_fails += 1
         log_error("normalise failed: %r" % (exc,))
-        return None, "error", round((time.monotonic() - t0) * 1000, 1)
+        if t_req is not None:
+            request_ms = (time.monotonic() - t_req) * 1000
+        return None, "error", _norm_timing(t0, setup_ms, request_ms)
 
 
 def append_normalise(row):
@@ -929,14 +962,19 @@ def run_hook(payload, dry_run=False):
     labels = resolve_pending(cache, prompt, session_id)
 
     injections, records = [], []
-    norm_text, norm_status, norm_ms = normalise(prompt, cache)
+    norm_text, norm_status, norm_timing = normalise(prompt, cache)
     if norm_text:
         injections.append(norm_text)
     if not dry_run:
         append_normalise({
             "ts": _iso(_now()), "session_id": session_id,
             "prompt_id": prompt_id, "status": norm_status,
-            "elapsed_ms": norm_ms, "model": NORMALISE_MODEL,
+            # elapsed_ms stays the total, so the 77 rows written before the
+            # split remain comparable; setup/request are the new detail.
+            "elapsed_ms": norm_timing["total_ms"],
+            "setup_ms": norm_timing["setup_ms"],
+            "request_ms": norm_timing["request_ms"],
+            "model": NORMALISE_MODEL,
             "prompt_chars": len(prompt),
             # The original alongside the restatement, so before/after is one
             # row rather than a join across two files. The transcript has both
@@ -1388,7 +1426,7 @@ def do_status():
 
     if os.path.exists(NORMALISE_LOG):
         import collections
-        st, times = collections.Counter(), []
+        st, times, req_times, setup_times = collections.Counter(), [], [], []
         with open(NORMALISE_LOG, errors="replace") as fh:
             for line in fh:
                 try:
@@ -1398,18 +1436,32 @@ def do_status():
                 st[d.get("status")] += 1
                 if d.get("elapsed_ms"):
                     times.append(d["elapsed_ms"])
+                if d.get("request_ms") is not None:
+                    req_times.append(d["request_ms"])
+                if d.get("setup_ms") is not None:
+                    setup_times.append(d["setup_ms"])
         n = sum(st.values())
         print("normalise  : %d invocation(s) — %s"
               % (n, ", ".join("%s=%d" % kv for kv in st.most_common())))
         if n:
             print("             restated %.0f%% of messages"
                   % (100.0 * st.get("restated", 0) / n))
-        if times:
-            times.sort()
-            print("             latency median %.0fms, p95 %.0fms, max %.0fms "
-                  "— paid on EVERY message"
-                  % (times[len(times) // 2],
-                     times[int(len(times) * 0.95)], times[-1]))
+        def _band(label, xs, note=""):
+            if not xs:
+                return
+            xs = sorted(xs)
+            print("             %-8s median %.0fms, p95 %.0fms, max %.0fms%s"
+                  % (label, xs[len(xs) // 2],
+                     xs[int(len(xs) * 0.95)], xs[-1], note))
+
+        # Total first for continuity with the older rows, then the split that
+        # says where the time actually goes. Rows written before the split
+        # have no request/setup fields, so those bands are simply shorter.
+        _band("total", times, " — paid on EVERY message")
+        _band("request", req_times)
+        _band("setup", setup_times, " (SDK import + .env)")
+        if times and not req_times:
+            print("             split unavailable: every row predates it")
         print("             before/after: intercept.py --normalise-log")
     else:
         print("normalise  : no invocations yet")
