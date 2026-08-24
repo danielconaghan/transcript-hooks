@@ -20,3 +20,4 @@ refined/
 # API credentials for the drafted fixes. Lives in ~/.claude-resync/.env;
 # this entry is a net in case one is ever created here by mistake.
 .env
+.DS_Store
