@@ -1364,8 +1364,13 @@ def do_status():
         print("  log only : %s  (precision below the %.0f%% floor)"
               % (" ".join(floored), E.PRECISION_FLOOR * 100))
     if suspended:
-        print("  suspended: %s  (premise falsified — fires and logs, never "
-              "surfaces)" % " ".join(suspended))
+        # Neutral wording on purpose: as of 2026-08-24 the four suspensions
+        # have three different causes (falsified premise, a check that cannot
+        # observe what it claims, an ask that returns nothing), so naming one
+        # of them in the header would mislabel the others. Each rule's own
+        # first sentence follows.
+        print("  suspended: %s  (fires and logs, never surfaces)"
+              % " ".join(suspended))
         for rid in suspended:
             why = (by_id.get(rid, {}).get("suspended_reason") or "").split(".")[0]
             if why:

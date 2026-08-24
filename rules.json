@@ -212,7 +212,9 @@
         "tool_use.input"
       ],
       "confidence": "high",
-      "fix": "Some operations are blocked by permission rules in this project. If a command is refused, adapt rather than retrying a simplified version of the same thing — repeated blocked attempts cost turns and change nothing. Ask for the operation to be run manually if it is required."
+      "fix": "Some operations are blocked by permission rules in this project. If a command is refused, adapt rather than retrying a simplified version of the same thing — repeated blocked attempts cost turns and change nothing. Ask for the operation to be run manually if it is required.",
+      "suspended": true,
+      "suspended_reason": "Retired 2026-08-24: not a preventative action. The trigger is `always` and the injection is a fixed paragraph about permission rules; `detail` is literally 'permission_mode-dependent'. It never reads an actual denial, so nothing about the message causes it and nothing about the situation shapes what it says. Evidence: 5 live fires across 5 sessions 2026-08-21..24, all identical. That makes it a standing instruction, which belongs in CLAUDE.md where it costs nothing; keeping it here charged 5 of 17 surfaced fires to a rule that had detected nothing, and mixed 'we spotted something' with 'we always say this' in the counts every precision figure is drawn from. Fires and logs so the counts stay comparable."
     },
     {
       "id": "R04",
@@ -480,7 +482,9 @@
       ],
       "confidence": "low-medium",
       "notes": "One measured instance. Kept because the action is silent, the check is near-free, and it fires often enough to gather precision data quickly.",
-      "fix": "These URL(s) in the message are not serving: {detail}. Say so explicitly rather than reporting success from a different address, and check the port before assuming the service is down."
+      "fix": "These URL(s) in the message are not serving: {detail}. Say so explicitly rather than reporting success from a different address, and check the port before assuming the service is down.",
+      "suspended": true,
+      "suspended_reason": "Suspended 2026-08-24: answers a question it cannot observe. `url_serves` probes from the machine running the hook, but a loopback address in a message need not refer to that machine. Falsified live on 2026-08-21 in session 74257b4c: the message was Cloudflare tunnel ingress (`lab.lattin-rawstrone.com` -> `http://localhost:8080`), where :8080 is the tunnel ORIGIN on the home-lab box. The hook probed its own loopback, found nothing, and injected 'these URL(s) are not serving ... say so explicitly rather than reporting success from a different address' - which is the mistake it was itself making. A confident falsehood about whether something is running is the fastest way to lose trust in every other rule. Unsuspend only with a host test that distinguishes 'loopback on this machine' from 'loopback on the machine under discussion'; note there is nothing to regress against, backtest basis is `none` with 0 corpus fires."
     },
     {
       "id": "R09",
@@ -625,7 +629,9 @@
         "user message text"
       ],
       "confidence": "low",
-      "fix": "This message states an absolute scope limit ({detail}). Ask whether that is a fixed architectural principle or simply out of scope for this build, since the two have different consequences."
+      "fix": "This message states an absolute scope limit ({detail}). Ask whether that is a fixed architectural principle or simply out of scope for this build, since the two have different consequences.",
+      "suspended": true,
+      "suspended_reason": "Suspended 2026-08-24: spends the scarce action and returns nothing. Two live asks, zero verdicts. The 2026-08-21 fire in 74257b4c asked 'fixed principle, or just not now?' about a message containing the words 'for now' - the answer was already in the text it had read. The 2026-08-20 fire in 13a50aad drew 'OK so it should run, but I'm just being too direct at the moment.. please just reply in afirmative or negative'. `ask` is the budgeted action (1.4% specced, 1.6% measured) and the whole service depends on staying inside it, so it cannot be spent on questions the message answers. Suspending costs no measurement because R11 has never produced one: precision null, basis `manual`, 2 corpus fires both unknown. Unsuspend with a trigger that requires the absolute claim to be UNQUALIFIED - RE_ABSOLUTE currently ignores 'for now', 'at the moment', 'until'."
     },
     {
       "id": "R12",
@@ -750,6 +756,7 @@
     "Real coverage of desync signals is far lower than it looks: 37% for corrections, 30% for re-asks, 33% for state questions (research/gaps.py). Naive counting says 63% for corrections, but 27 of 42 'covering' fires were content-blind — R03 fires on a session's first message whatever it says, and R05/R06/R08 on any reference mention.",
     "Only three rules have trustworthy (`auto`) evidence — R07, R10, R12 — with a combined n of 12. Six are unmeasurable by construction (tautological/manual/none), R01 is suspended, R09 never fires. The catalogue is 13 rules and about 1 rule's worth of dependable measurement.",
     "Compaction summaries are still ingested as human messages. The isMeta filter does not catch them ('This session is being continued from a previous conversation...' is a genuine user-role line), so they still generate fires and still enter the similarity comparisons.",
-    "No rule addresses the assistant asserting a state its own tool output contradicts (observed: 'still running, log ticking' against a stale log; '17 tests all green' against a broken dev server). Assistant-side, so outside an input interceptor — but it caused two of the desyncs in this corpus."
+    "No rule addresses the assistant asserting a state its own tool output contradicts (observed: 'still running, log ticking' against a stale log; '17 tests all green' against a broken dev server). Assistant-side, so outside an input interceptor — but it caused two of the desyncs in this corpus.",
+    "R03 RELOCATION (open): R03 is suspended as a rule, but the standing instruction it injected is still worth having - 'if a command is refused, adapt rather than retrying a simplified version; ask for it to be run manually if required'. It belongs in the user's global CLAUDE.md (~/.claude/CLAUDE.md), NOT in any one project's, because the service runs across every project. Not written there by claude-resync: a global CLAUDE.md edit changes behaviour in every session the user runs, which is the user's call and not a deployment step."
   ]
 }
