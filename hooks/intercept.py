@@ -182,6 +182,20 @@ def phase():
 # Cap on retained prior messages. R07 needs only the previous one; R01 compares
 # retractions against sent messages, and a few hundred is ample — an unresolved
 # retraction from 300 messages ago is not a live concern.
+def _engine_cfg(key, default):
+    """One engine-wide setting from rules.json's `engine` block.
+
+    The catalogue is the single place these live; the literal passed as
+    `default` is what the hook uses when rules.json is missing or unreadable,
+    because a hook that cannot load its config must still run rather than
+    refuse the prompt."""
+    try:
+        import rules_engine as E
+        return E.engine_param(key, default)
+    except Exception:
+        return default
+
+
 MAX_PRIOR = 300
 
 # Most interrupting fires one session may surface. The catalogue's own
@@ -191,7 +205,7 @@ MAX_PRIOR = 300
 # session that happens to trip several rules. Clamped fires are logged with
 # suppressed="ask-budget" rather than dropped silently, so the cap is visible
 # in the data instead of looking like the rules never fired.
-MAX_ASKS_PER_SESSION = 5
+MAX_ASKS_PER_SESSION = _engine_cfg("max_asks_per_session", 5)
 
 # A reply longer than this is treated as moving on, not answering. Verdicts are
 # short by nature; a 400-character instruction that opens with "no" is a new
@@ -665,8 +679,8 @@ def draft_via_api(spec, fire, state):
 # The cost is real and paid on every message: measured 1.6s on Haiku, 3.0s on
 # Sonnet, 5.5s on Opus. Haiku by default for that reason. Whether it pays for
 # itself is a phase 4 question, which is why every invocation is logged.
-NORMALISE_MODEL = "claude-haiku-4-5"
-NORMALISE_TIMEOUT_S = 4.0
+NORMALISE_MODEL = _engine_cfg("normalise.model", "claude-haiku-4-5")
+NORMALISE_TIMEOUT_S = _engine_cfg("normalise.timeout_s", 4.0)
 NORMALISE_MAX_TOKENS = 300
 
 # After this many consecutive failures the layer stops trying for the rest of

@@ -184,23 +184,27 @@ def _unresolved_retractions(state):
     sent message. Compared against messages in BOTH directions: a removal that
     matches an earlier send is the queue tidying up after itself, which is the
     check that stopped 4 of 37 historical fires being counted as withheld."""
+    min_chars = param("R01", "min_chars")
+    cmp_chars = param("R01", "compare_chars")
+    similarity = param("R01", "similarity")
     out = []
     for op in state.queue_ops:
         if op.get("op") != "remove" or not op.get("human"):
             continue
         content = op.get("content") or ""
-        if len(content) < 20:
+        if len(content) < min_chars:
             continue
         best = 0.0
         for m in state.prior_msgs:
             r = difflib.SequenceMatcher(
-                None, content[:400], (m.get("text") or "")[:400]).ratio()
+                None, content[:cmp_chars],
+                (m.get("text") or "")[:cmp_chars]).ratio()
             best = max(best, r)
         # Also compare against the message being sent right now: if this is a
         # reworded resend, there is nothing to surface.
         best = max(best, difflib.SequenceMatcher(
-            None, content[:400], state.prompt[:400]).ratio())
-        if best < 0.55:
+            None, content[:cmp_chars], state.prompt[:cmp_chars]).ratio())
+        if best < similarity:
             out.append(op)
     return out
 
@@ -340,18 +344,20 @@ def r06_unresolved_reference(state):
 
 
 def r07_near_duplicate(state):
-    if not state.prior_msgs or len(state.prompt) < 25:
+    min_chars = param("R07", "min_chars")
+    cmp_chars = param("R07", "compare_chars")
+    if not state.prior_msgs or len(state.prompt) < min_chars:
         return []
     prev = state.prior_msgs[-1]
     prev_text = prev.get("text") or ""
-    if len(prev_text) < 25:
+    if len(prev_text) < min_chars:
         return []
     if state.at and prev.get("at"):
-        if (state.at - prev["at"]).total_seconds() > 120:
+        if (state.at - prev["at"]).total_seconds() > param("R07", "window_s"):
             return []
     ratio = difflib.SequenceMatcher(
-        None, prev_text[:600], state.prompt[:600]).ratio()
-    if ratio < 0.85:
+        None, prev_text[:cmp_chars], state.prompt[:cmp_chars]).ratio()
+    if ratio < param("R07", "similarity"):
         return []
     flip = (len(RE_NEGATION.findall(prev_text))
             != len(RE_NEGATION.findall(state.prompt)))
@@ -424,7 +430,8 @@ def r12_dequeue_into_error(state):
         if op.get("op") != "dequeue" or not op.get("at"):
             continue
         near = [e for e in state.api_errors
-                if e and abs((e - op["at"]).total_seconds()) <= 90]
+                if e and abs((e - op["at"]).total_seconds())
+                <= param("R12", "window_s")]
         if near:
             fires.append(Fire(
                 "R12", "lost:" + op["at"].isoformat(),
@@ -465,6 +472,72 @@ def load_catalogue(path=None):
         return json.load(fh)
 
 
+# --------------------------------------------------------------------------
+# configuration — the catalogue configures the triggers, not just what
+# happens to their fires
+# --------------------------------------------------------------------------
+#
+# Thresholds used to live only in this file while rules.json described them in
+# English: R07 carried the prose ">=85% similarity to a message sent <120s
+# ago" next to a separate 0.85 and 120 here. Two copies of one number is how
+# R03's `trigger` came to claim "always" while the code fired once per
+# session. The catalogue is now the single copy, and the literals in
+# DEFAULT_PARAMS are only the fallback for a missing or unreadable file — a
+# hook that cannot read its config must still run.
+
+_CAT = None
+
+
+def _cat():
+    """The catalogue, read at most once per process. Separate from
+    load_catalogue() on purpose: that returns a fresh mutable dict because
+    backtest.py folds results into it, and handing every caller a shared
+    object would make one caller's edit another caller's surprise."""
+    global _CAT
+    if _CAT is None:
+        try:
+            _CAT = load_catalogue()
+        except Exception:
+            _CAT = {}
+    return _CAT
+
+
+def engine_param(key, default):
+    """One engine-wide setting, addressed dotted ("normalise.model").
+
+    Never raises. A missing key, a malformed catalogue and an explicit null all
+    give `default`, so adding a setting to the code before the catalogue knows
+    about it is safe in either order."""
+    node = _cat().get("engine")
+    for part in key.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return default
+        node = node[part]
+    return default if node is None else node
+
+
+# Fallbacks, used only when rules.json cannot be read. Keep in step with the
+# `params` block of the matching rule.
+DEFAULT_PARAMS = {
+    "R01": {"min_chars": 20, "compare_chars": 400, "similarity": 0.55},
+    "R07": {"min_chars": 25, "compare_chars": 600, "similarity": 0.85,
+            "window_s": 120},
+    "R12": {"window_s": 90},
+}
+
+
+def param(rule_id, key):
+    """One trigger parameter: catalogue first, then DEFAULT_PARAMS."""
+    v = None
+    for r in (_cat().get("rules") or []):
+        if r.get("id") == rule_id:
+            v = (r.get("params") or {}).get(key)
+            break
+    if v is None:
+        v = DEFAULT_PARAMS.get(rule_id, {}).get(key)
+    return v
+
+
 def evaluate(state, only=None, catalogue=None):
     """Run the rules over one pre-send state. Returns [Fire], rule order.
 
@@ -484,7 +557,7 @@ def evaluate(state, only=None, catalogue=None):
 
 
 # Precision at or above this is trusted enough to act on without asking.
-PRECISION_CEILING = 0.8
+PRECISION_CEILING = engine_param("precision_ceiling", 0.8)
 
 # Precision KNOWN to be below this is too wrong to spend attention on. Such a
 # rule still fires and still logs — it just never reaches the user.
@@ -499,7 +572,7 @@ PRECISION_CEILING = 0.8
 #
 # `None` is not "below the floor" — an unmeasured rule asks, because asking is
 # how it acquires the labels that measure it.
-PRECISION_FLOOR = 0.30
+PRECISION_FLOOR = engine_param("precision_floor", 0.30)
 
 # Which labelling bases may drive a behaviour change at all.
 #
