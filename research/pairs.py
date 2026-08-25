@@ -141,7 +141,7 @@ sys.path.insert(0, HERE)
 
 import backtest as B       # noqa: E402
 import session as S        # noqa: E402
-from normalize import strip_decoration   # noqa: E402
+from plaintext import strip_decoration   # noqa: E402
 
 # One file per session, not one file for everything. A stored verdict is
 # expensive and long-lived; per-session files mean a re-run rewrites one file,
@@ -568,15 +568,60 @@ SCHEMA = {
 }
 
 
+# --------------------------------------------------------------------------
+# the contract judge.py reads (see judge.py for what each field means)
+# --------------------------------------------------------------------------
+
+MODE = "session"        # one call per session; the response is an array
+UNIT_LABEL = "CANDIDATE PAIRS"
+
+
+def unit_key(u):
+    """The key the view was built with, not one recomputed from stored text."""
+    if u.get("unit_key"):
+        return u["unit_key"]
+    c = u.get("candidate") or {}
+    return pair_key((c.get("claim_a") or {}).get("text"),
+                    (c.get("claim_b") or {}).get("text"))
+
+
+def rows_from(data, todo, base):
+    """One verdict row per candidate sent, contradiction or not.
+
+    The prompt asks the model to omit pairs it rejected, so absence IS the
+    verdict — and an unrecorded rejection would be re-sent, and re-paid for, on
+    every future run. `attribute()` joins what came back onto what went out;
+    anything unclaimed is stored as `contradiction: null`."""
+    found = (data or {}).get("contradictions") or []
+    sent = {k: v for k, v in todo.items()}
+    hits, leftover = attribute(found, sent)
+    rows = []
+    for k, u in sent.items():
+        hit = hits.get(k)
+        c = u.get("candidate") or {}
+        rows.append(dict(base, kind="verdict", unit_key=k,
+                         claim_a_at=(c.get("claim_a") or {}).get("at"),
+                         claim_b_at=(c.get("claim_b") or {}).get("at"),
+                         shared_terms=c.get("shared_terms"),
+                         contradiction=hit[0] if hit else None,
+                         matched=hit[1] if hit else None))
+    for f in leftover:
+        # Never dropped: a finding is the expensive thing here, and losing one
+        # to a bookkeeping mismatch would be the worst trade available.
+        rows.append(dict(base, kind="verdict", unit_key=None,
+                         contradiction=f, matched="unattributed"))
+    return rows
+
+
 def pipeline_params():
     """Everything that shapes the payload, as a readable dict.
 
     Stored expanded on every run rather than only hashed: a hash tells you two
-    runs differed, this tells you how. `normalize_sha` covers the strip rules
+    runs differed, this tells you how. `plaintext_sha` covers the strip rules
     by hashing the module source, since those change the text the model sees
     without any parameter here moving."""
     try:
-        with open(os.path.join(HERE, "normalize.py"), "rb") as fh:
+        with open(os.path.join(HERE, "plaintext.py"), "rb") as fh:
             nsha = hashlib.sha1(fh.read()).hexdigest()[:12]
     except OSError:
         nsha = None
@@ -584,7 +629,7 @@ def pipeline_params():
             "min_term_chars": MIN_TERM_CHARS, "min_shared": MIN_SHARED,
             "min_claim_chars": MIN_CLAIM_CHARS, "context": CONTEXT,
             "context_chars": CONTEXT_CHARS, "claim_chars": CLAIM_CHARS,
-            "max_pairs": MAX_PAIRS, "normalize_sha": nsha}
+            "max_pairs": MAX_PAIRS, "plaintext_sha": nsha}
 
 
 def pipeline_sha(params=None):
@@ -604,7 +649,7 @@ def pair_key(claim_a_text, claim_b_text):
     alongside it, so the same pair judged by two models is visibly the same
     pair. Uses the stripped text, because that is what the model was shown:
     keying on the decorated original would re-send every pair the day
-    normalize.py changes a rule that alters nothing the model reads."""
+    plaintext.py changes a rule that alters nothing the model reads."""
     blob = "%s\x1f%s" % (claim_a_text or "", claim_b_text or "")
     return hashlib.sha1(blob.encode("utf-8", "replace")).hexdigest()[:16]
 
@@ -878,7 +923,7 @@ def audit(sids=None):
             # quote with markdown it never saw. Every word is right, so that is
             # neither a fabrication nor an elision, and failing it would have
             # reported a sound finding as unverifiable. This is precisely what
-            # normalize.py's idempotency buys: stripping an already-stripped
+            # plaintext.py's idempotency buys: stripping an already-stripped
             # quote is a no-op, and stripping a re-decorated one recovers it.
             q = norm(strip_decoration(raw_q or ""))
             if not q:
@@ -1139,7 +1184,9 @@ def main(argv=None):
         keyed = {}
         for pl in payload:
             c = pl["candidate"]
-            keyed[pair_key(c["claim_a"]["text"], c["claim_b"]["text"])] = pl
+            k = pair_key(c["claim_a"]["text"], c["claim_b"]["text"])
+            pl["unit_key"] = k          # stamped, never recomputed downstream
+            keyed[k] = pl
         cached = ({} if args.recheck
                   else load_verdicts(sid, args.model, PROMPT_VERSION))
         todo = {k: v for k, v in keyed.items() if k not in cached}

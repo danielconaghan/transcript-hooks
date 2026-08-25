@@ -5,7 +5,7 @@ The first deliberately **lossy** step in the pipeline:
 
     reduce.py     lossless archive of the whole corpus
     session.py    reads it; format facts only, drops nothing
-    normalize.py  lossy — removes formatting characters, keeps every word
+    plaintext.py  lossy — removes formatting characters, keeps every word
     pairs.py / chat.py   build a payload and make the call
 
 It is a separate module for the same reason `session.py` reads rather than
@@ -55,9 +55,9 @@ survives into the output, and the brief's own suggested marker is heavier than
 the backtick it would replace.
 
 Usage:
-    python3 normalize.py --self-test            # run the unit tests
-    python3 normalize.py --measure              # what it saves on the corpus
-    python3 normalize.py --show <session>       # before/after on real claims
+    python3 plaintext.py --self-test            # run the unit tests
+    python3 plaintext.py --measure              # what it saves on the corpus
+    python3 plaintext.py --show <session>       # before/after on real claims
 """
 
 import argparse

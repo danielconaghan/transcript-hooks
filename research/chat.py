@@ -108,7 +108,7 @@ sys.path.insert(0, HERE)
 import backtest as B       # noqa: E402
 import pairs as P          # noqa: E402  (cost maths, session selection)
 import session as S        # noqa: E402  (the reader)
-from normalize import strip_decoration   # noqa: E402
+from plaintext import strip_decoration   # noqa: E402
 
 CHAT_DIR = os.path.join(B.resync_home(), "chat")
 
@@ -443,16 +443,45 @@ def append_rows(sid, rows):
     os.chmod(p, 0o600)
 
 
+# --------------------------------------------------------------------------
+# the contract judge.py reads
+# --------------------------------------------------------------------------
+
+MODE = "unit"           # one call per exchange
+UNIT_LABEL = "EXCHANGE"
+
+
+def unit_key(u):
+    """The key the view was built with, not one recomputed from stored text."""
+    if u.get("unit_key"):
+        return u["unit_key"]
+    ex = u.get("exchange") or {}
+    return exchange_key((ex.get("developer") or {}).get("text"),
+                        (ex.get("assistant") or {}).get("text"))
+
+
+def rows_from(data, todo, base):
+    """One row per exchange judged. An empty findings list is a real verdict —
+    storing it is what stops the exchange being re-sent forever."""
+    rows = []
+    for k, u in todo.items():
+        rows.append(dict(base, kind="verdict", unit_key=k,
+                         developer_at=((u.get("exchange") or {})
+                                       .get("developer") or {}).get("at"),
+                         findings=(data or {}).get("findings") or []))
+    return rows
+
+
 def pipeline_params():
     try:
-        with open(os.path.join(HERE, "normalize.py"), "rb") as fh:
+        with open(os.path.join(HERE, "plaintext.py"), "rb") as fh:
             nsha = hashlib.sha1(fh.read()).hexdigest()[:12]
     except OSError:
         nsha = None
     return {"lookahead_turns": LOOKAHEAD_TURNS, "turn_chars": TURN_CHARS,
             "prev_chars": PREV_CHARS, "later_chars": LATER_CHARS,
             "error_chars": ERROR_CHARS, "max_actions": MAX_ACTIONS,
-            "normalize_sha": nsha}
+            "plaintext_sha": nsha}
 
 
 def pipeline_sha(params=None):
@@ -711,7 +740,12 @@ def main(argv=None):
         for ex in exchanges(ts):
             dev, reply, _ = ex
             k = exchange_key(dev["text"], (reply or {}).get("text"))
-            keyed[k] = build_payload(sid, ts, acts, ex)
+            # Stamped into the unit rather than recomputed later. The payload
+            # truncates turn text at TURN_CHARS, so a key derived from the
+            # STORED unit differs from one derived from the source for any
+            # exchange longer than that — 3 of 30 in the first session judged.
+            # Carrying the key removes the class of bug entirely.
+            keyed[k] = dict(build_payload(sid, ts, acts, ex), unit_key=k)
         judged = {} if args.recheck else load_judged(sid, args.model,
                                                      PROMPT_VERSION)
         todo = {k: v for k, v in keyed.items() if k not in judged}

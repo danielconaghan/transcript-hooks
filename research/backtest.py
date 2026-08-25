@@ -100,7 +100,28 @@ def load_markers():
 
     Empty when classify.py has not run, in which case hindsight labelling falls
     back to RE_CORRECTION — measured at roughly 46% recall, which is why the
-    markers are preferred whenever they exist."""
+    markers are preferred whenever they exist.
+
+    `desync.jsonl` is an append-only log, so one message can hold several rows:
+    the corpus has 662 rows over 541 distinct messages, because a Haiku pilot
+    judged 40 of them before the Opus pass. **41 of those pairs exist and 13
+    disagree on the verdict**, so which row wins is a real decision, not
+    bookkeeping. Counting rows rather than keys inflates the marker total from
+    122 to 161 — a mistake worth naming, because those figures get quoted.
+
+    Last-write-wins currently resolves to Opus for all 541, but only because
+    the Opus pass ran last. A later pilot re-run would silently take over the
+    labels, so the keeper model is named here rather than left to run order."""
+    return markers_by_model(KEEPER_MODEL)
+
+
+KEEPER_MODEL = "claude-opus-5"
+
+
+def markers_by_model(model=None):
+    """{msg_key: row} for desync markers, one row per message.
+
+    `model=None` keeps genuine last-write-wins across every model."""
     out = {}
     if not os.path.exists(DESYNC):
         return out
@@ -110,8 +131,11 @@ def load_markers():
                 d = json.loads(line)
             except Exception:
                 continue
-            if d.get("key"):
-                out[d["key"]] = d          # last write wins
+            if not d.get("key"):
+                continue
+            if model and d.get("model") != model:
+                continue
+            out[d["key"]] = d          # file order is append order
     return {k: v for k, v in out.items() if v.get("desync")}
 
 

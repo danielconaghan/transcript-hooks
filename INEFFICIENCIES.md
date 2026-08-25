@@ -38,7 +38,7 @@ This splits the whole list in two and decides what instrument can see it.
 
 | | |
 |---|---|
-| **Developer noticed** | They wrote a correction. `classify.py` can find it — 161 markers, the well-covered half. |
+| **Developer noticed** | They wrote a correction. `classify.py` can find it — 122 markers, the well-covered half. |
 | **Nobody noticed** | No correction exists, so there is nothing to find in the developer's messages. Invisible to every instrument built so far. |
 
 **A1, B3, C2, D2 and E1 live in the second half.** That is where the real
@@ -64,7 +64,7 @@ goes unnoticed.
 | Id | Category | Evidence | Measured today |
 |---|---|---|---|
 | B1 | **Acted on an unverified premise** | `2ac71e1f`: a `believed` root cause, with a live refresh run against prod on top of it | `pairs.py`, partially |
-| B2 | **Working from a stale fact** | `correction` × 83 — **the largest single bucket** | `classify.py`; R05 |
+| B2 | **Working from a stale fact** | `correction` × 67 — **the largest single bucket** | `classify.py`; R05 |
 | B3 | **Post-compaction rework** — redone because context was lost | one observed compaction took 42,449 tokens to 9,114, preserving 5 of 46 messages | nothing |
 
 ## C. Execution
@@ -73,7 +73,7 @@ goes unnoticed.
 |---|---|---|---|
 | C1 | **Costly self-correction** — corrected itself after spending something | 2 of 4 `pairs.py` findings carry rework | **`pairs.py` — this is its category** |
 | C2 | **Repeated failing action** — same approach retried into the same wall | **1** run, once the signature is required to match (`tabs_context_mcp` 4x, 3 failing). An earlier figure of 8-9 runs counted *any* 3 consecutive failures, which is a different and much weaker claim — different commands failing in a row is not retrying into a wall. 226 runs repeat a signature 3+ times but mostly succeed, which is ordinary iteration | `session.py` computes it deterministically; **no detector uses it yet** |
-| C3 | **Scope overrun** — did more than was wanted | `scope` × 15 | `classify.py`, only when the developer complained |
+| C3 | **Scope overrun** — did more than was wanted | `scope` × 10 | `classify.py`, only when the developer complained |
 | C4 | **Work undone** — output actively reversed | `undo` × 1 | `classify.py` |
 
 C1 must be split on cost. A free self-correction does not belong here.
@@ -82,7 +82,7 @@ C1 must be split on cost. A free self-correction does not belong here.
 
 | Id | Category | Evidence | Measured today |
 |---|---|---|---|
-| D1 | **Illegible progress** — the developer cannot tell what is happening | `state-question` × 14; `rules_engine.RE_STATE_QUESTION` is written and wired to nothing | half-built (the R14 candidate) |
+| D1 | **Illegible progress** — the developer cannot tell what is happening | `state-question` × 10; `rules_engine.RE_STATE_QUESTION` is written and wired to nothing | half-built (the R14 candidate) |
 | D2 | **Asserted a state its own tool output contradicts** | *"17 tests, all green"* against a dev server it had just broken; *"still running, log ticking"* against a 3.5-minute-stale log | **nothing** — recorded as `rules.json`'s largest open gap |
 | D3 | **Answer not actionable** — right content, wrong altitude or no acceptance criterion | assistant turns run **10.7x** the developer's word count (median 462 vs 19); the median reply is **23x** the words of the request, p90 80x, max 1106x. (An earlier 15.6x/678x was measured through `friction.py`, which truncated text at 4,000 chars — 1.0% of events, but the long tail) | R10; `chat.py --metrics` computes the ratios free |
 
@@ -93,7 +93,7 @@ C1 must be split on cost. A free self-correction does not belong here.
 | E1 | **Asked what it could have determined itself** | an off-menu answer reading *"I would like you to continue working without interactions with me until you are able to fulfil the brief"* | nothing |
 | E2 | **Did not ask when it should have** | `a0c27fd2`: AskUserQuestion rejected → *"I'll make the calls myself and flag the assumptions"* → the same message re-sent 19 seconds later | nothing |
 | E3 | **The developer had to repeat themselves** | 12 near-duplicate consecutive re-sends across 5 sessions | R07 |
-| E4 | **A fix did not land and the symptom was re-reported** | `re-report` × 43 | `classify.py` |
+| E4 | **A fix did not land and the symptom was re-reported** | `re-report` × 29 | `classify.py` |
 
 ---
 
@@ -173,13 +173,21 @@ the figure so a later reader can tell a measurement from an assumption. When a
 figure is superseded, replace it and note the date — a stale number that reads
 as current is worse than no number.
 
-The counts here were measured on 2026-08-24 against 56 sessions in `refined/`
-(46 with candidate pairs), 161 desync markers across 27 sessions, and 545
-developer messages. `classify.py` marker kinds at that date:
+The counts here were measured against 56 sessions in `refined/` (46 with
+candidate pairs), **122 desync markers across 26 sessions**, and 543 developer
+messages. `classify.py` marker kinds:
 
 ```
-correction 83   re-report 43   scope 15   state-question 14   misread 5   undo 1
+correction 67   re-report 29   scope 10   state-question 10   misread 5   undo 1
 ```
+
+**Re-baselined 2026-08-25.** The earlier figures (161 markers, 27 sessions)
+counted ROWS in `desync.jsonl`, which is append-only: 662 rows cover 541
+distinct messages, because a Haiku pilot judged 40 of them before the Opus
+pass. 41 messages hold more than one verdict and **13 of those disagree**, so
+choosing a row is a real decision. `backtest.load_markers()` was always right —
+it keys by message — but this document quoted the raw row counts. Marker totals
+are now taken per message from the keeper model.
 
 Open questions, unresolved:
 
@@ -198,7 +206,7 @@ Open questions, unresolved:
 
     reduce.py     corpus/  -> refined/            lossless, 140x, verified
     session.py    refined/ -> tagged records      format facts; drops nothing
-    normalize.py  strips markdown                 lossy, OUTBOUND EDGE ONLY
+    plaintext.py  strips markdown                 lossy, OUTBOUND EDGE ONLY
     pairs.py      C1, B1                          claim pairs
     chat.py       A1 A2 C3 D1 D3 E1 E2            exchanges, with actions
     actions.py    C2, C4, B3                      action log
