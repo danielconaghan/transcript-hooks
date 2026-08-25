@@ -312,6 +312,18 @@ RUNTIME_FILES = [
     ("rules.json", "rules.json", 0o644),
 ]
 
+# Slash commands, deployed into <claude_dir>/commands/ — the same scope the
+# hooks are registered in, so a --project install does not leak a command into
+# every other project.
+#
+# These were not installed at all until 2026-08-25. `/ds` worked only where
+# someone had copied it by hand, which meant a fresh install had the hooks, the
+# catalogue and no way to record a retrospective marker — the one thing the
+# corpus cannot reconstruct for itself.
+COMMAND_FILES = [
+    ("commands/ds.md", "ds.md", 0o644),
+]
+
 
 ENVFILE_TEMPLATE = """\
 # Credentials for claude-resync's API-drafted fixes.
@@ -384,8 +396,37 @@ def ensure_envfile(dest_dir):
 
 
 def repo_root():
-    """This installer lives in hooks/, so the repo is one level up."""
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    """This installer lives at the repo root.
+
+    It was in `hooks/` until 2026-08-25, which was wrong: it deploys the hooks
+    AND `rules_engine.py` AND `rules.json` AND the slash commands, so it is not
+    a hook — it is the installer for all of them, and burying it under one of
+    the things it installs made the layout read backwards."""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def deploy_commands(project):
+    """Copy the slash commands into the same scope the hooks were registered in.
+
+    Scope matters: a default install registers hooks in `~/.claude` and the
+    commands belong there too, while `--project` keeps both inside that
+    project. Installing a command globally for a project-scoped recorder would
+    put `/ds` in every unrelated project, where it would write markers into a
+    corpus that is not recording."""
+    root = repo_root()
+    dest_dir = os.path.join(claude_dir(project), "commands")
+    os.makedirs(dest_dir, exist_ok=True)
+    out = []
+    for rel, name, mode in COMMAND_FILES:
+        src = os.path.join(root, rel)
+        if not os.path.exists(src):
+            raise SystemExit("ERROR: %s not found in the repo (%s)."
+                             % (rel, src))
+        dest = os.path.join(dest_dir, name)
+        shutil.copyfile(src, dest)
+        os.chmod(dest, mode)
+        out.append(dest)
+    return out
 
 
 def deploy_runtime(dest_dir):
@@ -502,9 +543,13 @@ def cmd_deploy(args):
     into place."""
     dest = recorder_dir()
     deployed = deploy_runtime(dest)
+    commands = deploy_commands(args.project)
     print("runtime deployed from %s" % repo_root())
     print("  to %s" % dest)
     for d in deployed:
+        print("     %s" % os.path.basename(d))
+    print("  commands to %s" % os.path.dirname(commands[0]))
+    for d in commands:
         print("     %s" % os.path.basename(d))
     print("\nsettings untouched. Use `install` to (re-)register hooks,")
     print("and `intercept.py --status` to confirm what is live.")
@@ -521,8 +566,9 @@ def cmd_install(args):
         print("!! machine, across all projects (including their secrets).")
         print("!! Use --project PATH to restrict recording to one project.\n")
 
-    # 1. deploy the runtime + prepare the global corpus
+    # 1. deploy the runtime + slash commands + prepare the global corpus
     deployed = deploy_runtime(recorder_dir())
+    commands = deploy_commands(project)
     dest = deployed[0]
     cpath = corpus_path()
     ensure_corpus(cpath)
@@ -728,6 +774,7 @@ def build_parser():
     sp = sub.add_parser(
         "deploy", help="copy the runtime into ~/.claude-resync, touching no "
                        "settings — use after editing rules.json or the engine")
+    add_target(sp)          # commands follow the scope the hooks were put in
     sp.set_defaults(func=cmd_deploy)
 
     sp = sub.add_parser("uninstall", help="remove only the recorder hooks")
