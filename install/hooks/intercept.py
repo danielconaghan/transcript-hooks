@@ -141,8 +141,13 @@ def resync_home():
 
 
 HOME_DIR = resync_home()
-CACHE_DIR = os.path.join(HOME_DIR, "intercept-cache")
-DATA_DIR = os.path.join(HOME_DIR, "data")
+# The live runtime lives under collection/; corpus/ and refined/ stay at the
+# root because analysis reads them too. HOME_DIR is still resolved from the
+# environment, not from this file's location, so the deployed copy can sit
+# anywhere the installer puts it.
+COLLECTION_DIR = os.path.join(HOME_DIR, "collection")
+CACHE_DIR = os.path.join(COLLECTION_DIR, "cache")
+DATA_DIR = os.path.join(COLLECTION_DIR, "data")
 FIRES = os.path.join(DATA_DIR, "fires.jsonl")
 LABELS = os.path.join(DATA_DIR, "labels.jsonl")
 ERRLOG = os.path.join(DATA_DIR, "intercept-errors.log")
@@ -164,7 +169,8 @@ ENVFILE = os.path.join(HOME_DIR, ".env")
 # "intercept.py". Kept in step with install.py's SENTINELS, and listing the
 # pre-rename home so uninstall still works on an older install.
 SENTINELS = (
-    ".claude-resync/intercept.py",
+    ".claude-resync/collection/hooks/intercept.py",
+    ".claude-resync/intercept.py",         # pre-collection/ flat layout
     ".claude-transcripts/intercept.py",    # legacy
 )
 

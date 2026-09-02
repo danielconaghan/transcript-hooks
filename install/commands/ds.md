@@ -1,10 +1,10 @@
 ---
 description: Record a desync at the moment it surfaces
 argument-hint: "[-N] what went wrong, and what the right answer was"
-allowed-tools: Bash(python3:*)
+allowed-tools: Bash(python3 "$HOME/.claude-resync/collection/hooks/intercept.py":*), Bash(python3:*)
 ---
 
-!`python3 "$HOME/.claude-resync/intercept.py" --mark-desync "$ARGUMENTS"`
+!`python3 "$HOME/.claude-resync/collection/hooks/intercept.py" --mark-desync "$ARGUMENTS"`
 
 The desync above has been recorded to `markers.jsonl`. Do not analyse it, do
 not apologise for it, and do not change course because of it — it is a research

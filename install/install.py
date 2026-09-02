@@ -67,6 +67,7 @@ Design notes:
 """
 
 import argparse
+import glob
 import json
 import os
 import shutil
@@ -100,8 +101,10 @@ TRANSCRIPTS_HOME = (os.environ.get("CLAUDE_RESYNC_HOME")
 # current home and the pre-rename one are listed, so uninstall still works on
 # an install that predates the rename.
 SENTINELS = (
-    ".claude-resync/recorder.py",
-    ".claude-resync/intercept.py",
+    ".claude-resync/collection/hooks/recorder.py",
+    ".claude-resync/collection/hooks/intercept.py",
+    ".claude-resync/recorder.py",          # pre-collection/ flat layout
+    ".claude-resync/intercept.py",         # pre-collection/ flat layout
     ".claude-transcripts/recorder.py",     # legacy
     ".claude-transcripts/intercept.py",    # legacy
 )
@@ -112,15 +115,40 @@ SENTINEL_INTERCEPT = SENTINELS[1]
 def is_ours(command):
     return isinstance(command, str) and any(x in command for x in SENTINELS)
 
+
+def script_of(command):
+    """The .py path out of one of our hook commands, $HOME expanded."""
+    for token in (command or "").split('"'):
+        if token.endswith(".py"):
+            return os.path.expandvars(os.path.expanduser(token))
+    return ""
+
+
+def registered_commands(hooks):
+    """Every hook command in a settings `hooks` block that belongs to us."""
+    if not isinstance(hooks, dict):
+        return []
+    return [c.get("command") for groups in hooks.values()
+            for g in (groups or []) if isinstance(g, dict)
+            for c in g.get("hooks", []) if isinstance(c, dict)
+            and is_ours(c.get("command"))]
+
+# Where the hooks live, as the shell sees it. One constant, because when
+# collection/ was introduced the deploy moved and these two commands did not:
+# every hook then pointed at a path that no longer existed, and `|| true`
+# swallowed the error for eight days. Derive, never restate.
+HOOKS_SH_DIR = "$HOME/.claude-resync/collection/hooks"
+
+
 # The hook command. $HOME is expanded by the shell inside double quotes, so this
 # one form is portable across machines and works for both global and
 # project-scoped registration (the recorder is always deployed globally).
 def command_for(event):
-    return 'python3 "$HOME/.claude-resync/recorder.py" %s || true' % event
+    return 'python3 "%s/recorder.py" %s || true' % (HOOKS_SH_DIR, event)
 
 
 def intercept_command():
-    return 'python3 "$HOME/.claude-resync/intercept.py" || true'
+    return 'python3 "%s/intercept.py" || true' % HOOKS_SH_DIR
 
 # Reserved buffer that Claude Code subtracts from the compaction window. A
 # window at or below this collapses the trigger threshold to zero and
@@ -134,12 +162,178 @@ WINDOW_SAFE = 30000         # warn between floor and this
 # path resolution
 # --------------------------------------------------------------------------- #
 
+# The home is split in three, because the parts have different owners and
+# different lifetimes.
+#
+#     <home>/corpus/      raw capture          ROOT: shared input
+#     <home>/refined/     lossless archive     ROOT: shared input
+#     <home>/.env .venv/                       ROOT: shared credentials + SDK
+#
+#     <home>/collection/  everything that runs LIVE
+#         hooks/          recorder.py, intercept.py
+#         rules_engine.py rules.json
+#         cache/          per-session interception state
+#         data/           fires, labels, normalise, markers, error log
+#
+#     <home>/analysis/    everything that runs OFFLINE, on stored data
+#         views/          deterministic views, free to regenerate
+#         verdicts/       model judgements, paid for
+#         data/           desync.jsonl, directive.jsonl
+#
+# corpus/ and refined/ sit at the root rather than under collection/ because
+# collection WRITES them and analysis READS them: filing shared input under one
+# consumer would say it belongs to that one. The previous flat layout put a
+# live fires.jsonl next to a research desync.jsonl in the same data/ directory,
+# which is how a marker file gets hunted for.
+#
+# Naming caveat, worth stating: intercept.py is an INTERVENTION — the
+# preventative actions and the normalisation layer — not collection. It lives
+# here because it is a hook and splitting it from recorder.py would scatter the
+# live runtime, so "collection" means "everything that runs live" rather than
+# "everything that captures".
+
 def recorder_dir():
-    return TRANSCRIPTS_HOME
+    """Where the live runtime is deployed."""
+    return os.path.join(TRANSCRIPTS_HOME, "collection")
+
+
+def hooks_dir():
+    return os.path.join(recorder_dir(), "hooks")
+
+
+def analysis_dir():
+    return os.path.join(TRANSCRIPTS_HOME, "analysis")
 
 
 def corpus_path():
     return os.path.join(TRANSCRIPTS_HOME, "corpus")
+
+
+# Old flat location -> new home. Applied by `migrate_layout()` on any install
+# or deploy, so an existing install moves itself rather than needing a manual
+# shuffle and rather than silently running two layouts at once.
+LAYOUT_MOVES = [
+    ("intercept-cache", "collection/cache"),
+    ("views", "analysis/views"),
+    ("verdicts", "analysis/verdicts"),
+]
+# data/ splits by who writes the file, which the flat layout could not express.
+DATA_MOVES = [
+    ("fires.jsonl", "collection/data"),
+    ("labels.jsonl", "collection/data"),
+    ("normalise.jsonl", "collection/data"),
+    ("markers.jsonl", "collection/data"),
+    ("intercept-errors.log", "collection/data"),
+    ("desync.jsonl", "analysis/data"),
+    ("directive.jsonl", "analysis/data"),
+    # Superseded by analysis/verdicts/, kept as history rather than deleted:
+    # it is the pre-per-session verdict store and cost real money.
+    ("ledger.jsonl", "analysis/data"),
+]
+
+
+# Directories the split owns. Anything else at the root that has a counterpart
+# under analysis/verdicts/ is a pre-split leftover.
+RESERVED_DIRS = ("corpus", "refined", "collection", "analysis", "data",
+                 ".venv", "__pycache__")
+
+
+def _is_superset(new_dir, old_dir):
+    """Is every row of every file in old_dir present in new_dir?
+
+    Compared on content with the renamed key fields excluded, because
+    migration renamed pair_key/exchange_key to unit_key. Any file without a
+    counterpart, or any row that does not appear, makes this False."""
+    for f in glob.glob(os.path.join(old_dir, "*.jsonl")):
+        counterpart = os.path.join(new_dir, os.path.basename(f))
+        if not os.path.isfile(counterpart):
+            return False
+
+        def rows(path):
+            out = []
+            for line in open(path, errors="replace"):
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    return None
+                out.append(json.dumps(
+                    {k: v for k, v in d.items()
+                     if k not in ("kind", "pair_key", "exchange_key",
+                                  "unit_key", "view")},
+                    sort_keys=True, default=str))
+            return out
+
+        old_rows, new_rows = rows(f), rows(counterpart)
+        if old_rows is None or new_rows is None:
+            return False
+        if any(r not in set(new_rows) for r in old_rows):
+            return False
+    return True
+
+
+def migrate_layout():
+    """Move an old flat install into collection/ and analysis/. Idempotent.
+
+    Never overwrites: if the destination already exists the source is left
+    alone and reported, because two copies of a corpus-derived file are a
+    problem to look at rather than to resolve automatically."""
+    moved, skipped = [], []
+    for old, new in LAYOUT_MOVES:
+        src = os.path.join(TRANSCRIPTS_HOME, old)
+        dst = os.path.join(TRANSCRIPTS_HOME, new)
+        if not os.path.isdir(src):
+            continue
+        if os.path.exists(dst):
+            skipped.append((old, new))
+            continue
+        os.makedirs(os.path.dirname(dst), mode=0o700, exist_ok=True)
+        shutil.move(src, dst)
+        moved.append((old, new))
+    for name, sub in DATA_MOVES:
+        src = os.path.join(TRANSCRIPTS_HOME, "data", name)
+        dst = os.path.join(TRANSCRIPTS_HOME, sub, name)
+        if not os.path.isfile(src):
+            continue
+        if os.path.exists(dst):
+            skipped.append(("data/" + name, sub + "/" + name))
+            continue
+        os.makedirs(os.path.dirname(dst), mode=0o700, exist_ok=True)
+        shutil.move(src, dst)
+        moved.append(("data/" + name, sub + "/" + name))
+    # Per-view verdict directories that predate analysis/verdicts/. Removed
+    # only when the migrated copy is a superset row for row: a verdict was paid
+    # for, so "probably a duplicate" is not good enough to delete on.
+    for old in sorted(glob.glob(os.path.join(TRANSCRIPTS_HOME, "*"))):
+        name = os.path.basename(old)
+        if not os.path.isdir(old) or name in RESERVED_DIRS:
+            continue
+        new_dir = os.path.join(TRANSCRIPTS_HOME, "analysis", "verdicts", name)
+        if not os.path.isdir(new_dir):
+            continue
+        if _is_superset(new_dir, old):
+            shutil.rmtree(old)
+            moved.append((name + "/", "(removed, superseded by analysis/verdicts/%s)" % name))
+        else:
+            skipped.append((name + "/", "analysis/verdicts/" + name))
+
+    # Empty directories the old layout left behind. Only ever empty ones —
+    # a directory with anything in it is reported, never removed.
+    for old in sorted(glob.glob(os.path.join(TRANSCRIPTS_HOME, "*"))):
+        name = os.path.basename(old)
+        if os.path.isdir(old) and name not in RESERVED_DIRS and not os.listdir(old):
+            os.rmdir(old)
+            moved.append((name + "/", "(removed, empty)"))
+
+    # Old deployed entrypoints at the root: the new ones live in
+    # collection/hooks/ and are written by deploy_runtime.
+    for name in ("recorder.py", "intercept.py", "rules_engine.py", "rules.json"):
+        old = os.path.join(TRANSCRIPTS_HOME, name)
+        if os.path.isfile(old) and os.path.isfile(
+                os.path.join(recorder_dir(), name if name.endswith(".json")
+                             or name == "rules_engine.py" else "hooks/" + name)):
+            os.remove(old)
+            moved.append((name, "(removed, superseded)"))
+    return moved, skipped
 
 
 def claude_dir(project):
@@ -306,8 +500,8 @@ def check_local_shadow(cdir):
 # entrypoints; the engine and the catalogue live at the repo root because both
 # the hooks and the research scripts depend on them and neither owns them.
 RUNTIME_FILES = [
-    ("hooks/recorder.py", "recorder.py", 0o755),
-    ("hooks/intercept.py", "intercept.py", 0o755),
+    ("hooks/recorder.py", "hooks/recorder.py", 0o755),
+    ("hooks/intercept.py", "hooks/intercept.py", 0o755),
     ("rules_engine.py", "rules_engine.py", 0o644),
     ("rules.json", "rules.json", 0o644),
 ]
@@ -442,11 +636,18 @@ def deploy_runtime(dest_dir):
         if not os.path.exists(src):
             raise SystemExit("ERROR: %s not found in the repo (%s)." % (rel, src))
         dest = os.path.join(dest_dir, name)
+        os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
         shutil.copyfile(src, dest)
         os.chmod(dest, mode)
         out.append(dest)
-    for sub in ("data", "intercept-cache"):
-        d = os.path.join(dest_dir, sub)
+    # Both trees, every time: an install that creates only what it happens to
+    # write leaves the other half to be created by whoever touches it first,
+    # with whatever permissions they choose.
+    for d in (os.path.join(dest_dir, "data"),
+              os.path.join(dest_dir, "cache"),
+              os.path.join(analysis_dir(), "data"),
+              os.path.join(analysis_dir(), "views"),
+              os.path.join(analysis_dir(), "verdicts")):
         os.makedirs(d, mode=0o700, exist_ok=True)
         try:
             os.chmod(d, 0o700)
@@ -541,9 +742,14 @@ def cmd_deploy(args):
 
     The repo is the source of truth; this is the only sanctioned way to move it
     into place."""
+    moved, skipped = migrate_layout()
     dest = recorder_dir()
     deployed = deploy_runtime(dest)
     commands = deploy_commands(args.project)
+    for a, b in moved:
+        print("moved  %s -> %s" % (a, b))
+    for a, b in skipped:
+        print("KEPT   %s (destination %s already exists — resolve by hand)" % (a, b))
     print("runtime deployed from %s" % repo_root())
     print("  to %s" % dest)
     for d in deployed:
@@ -566,15 +772,22 @@ def cmd_install(args):
         print("!! machine, across all projects (including their secrets).")
         print("!! Use --project PATH to restrict recording to one project.\n")
 
+    # 0. move an old flat install into collection/ + analysis/ first, so the
+    #    deploy below writes beside the migrated data rather than beside a
+    #    half-moved copy of it.
+    moved, skipped = migrate_layout()
+
     # 1. deploy the runtime + slash commands + prepare the global corpus
     deployed = deploy_runtime(recorder_dir())
     commands = deploy_commands(project)
     dest = deployed[0]
     cpath = corpus_path()
     ensure_corpus(cpath)
-    env_state = ensure_envfile(recorder_dir())
+    # Root, not collection/: intercept.py reads .env from HOME_DIR and the
+    # analysis scripts import the same SDK. Shared, so neither half owns it.
+    env_state = ensure_envfile(TRANSCRIPTS_HOME)
     sdk_state = ("SKIPPED (--no-sdk)" if args.no_sdk
-                 else ensure_sdk(recorder_dir()))
+                 else ensure_sdk(TRANSCRIPTS_HOME))
 
     # 2. merge hooks (strip-then-add makes this idempotent)
     settings = load_settings(spath)
@@ -600,9 +813,9 @@ def cmd_install(args):
         print("             %s" % os.path.basename(d))
     print("  intercept: %s" % ("registered" if not args.no_intercept
                                else "NOT registered (--no-intercept)"))
-    print("  sdk      : %s  (%s)" % (sdk_state, venv_dir(recorder_dir())))
+    print("  sdk      : %s  (%s)" % (sdk_state, venv_dir(TRANSCRIPTS_HOME)))
     print("  .env     : %s  (%s)"
-          % (env_state, os.path.join(recorder_dir(), ".env")))
+          % (env_state, os.path.join(TRANSCRIPTS_HOME, ".env")))
     print("  corpus   : %s  (global, 0700, gitignored)" % cpath)
     print("  records  : %s" % ("ALL sessions on this machine"
                                if is_global else "sessions in %s" % os.path.abspath(project)))
@@ -641,7 +854,7 @@ def cmd_status(args):
     for event, _ in EVENTS:
         groups = hooks.get(event, []) if isinstance(hooks, dict) else []
         found = any(
-            SENTINEL in (c.get("command") or "")
+            is_ours(c.get("command")) and "recorder.py" in (c.get("command") or "")
             for g in groups if isinstance(g, dict)
             for c in g.get("hooks", []) if isinstance(c, dict)
         )
@@ -664,12 +877,26 @@ def cmd_status(args):
     print("  catalogue  : %s"
           % ("DRIFTED from the repo — re-run install" if drift
              else "in sync with the repo"))
-    print("  sdk        : %s" % ("present" if sdk_present(rdir)
+    # TRANSCRIPTS_HOME, not rdir: cmd_install writes both to the root, where
+    # collection and analysis share them. Asking collection/ for them reported
+    # a working install as broken.
+    print("  sdk        : %s" % ("present" if sdk_present(TRANSCRIPTS_HOME)
                                  else "missing — API fixes use templates"))
     print("  .env       : %s" % ("present" if os.path.exists(
-        os.path.join(rdir, ".env")) else "absent"))
+        os.path.join(TRANSCRIPTS_HOME, ".env")) else "absent"))
     print("  (rule routing, fire and verdict counts: "
-          "python3 %s/intercept.py --status)" % rdir)
+          "python3 %s/intercept.py --status)" % hooks_dir())
+
+    # A registered hook whose script is missing is the one failure this tool
+    # cannot see by itself: every hook command ends in `|| true`, so a dead
+    # path records nothing and reports nothing. Check the file, not the string.
+    missing = sorted({c for c in registered_commands(hooks)
+                      if not os.path.exists(script_of(c))})
+    if missing:
+        print("  !! REGISTERED BUT MISSING — these hooks are silently no-ops:")
+        for c in missing:
+            print("     %s" % script_of(c))
+        print("     re-run `install.py install` to re-point them.")
 
     cpath = corpus_path()
     sessions, snaps, total = _corpus_stats(cpath)
