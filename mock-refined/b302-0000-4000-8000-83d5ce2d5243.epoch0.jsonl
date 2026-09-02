@@ -1,0 +1,4 @@
+{"type": "user", "uuid": "u0001", "timestamp": "2026-05-12T09:00:20.000Z", "sessionId": "mock", "cwd": "/repo", "message": {"role": "user", "content": "We use pnpm here, not npm."}}
+{"type": "assistant", "uuid": "u0002", "timestamp": "2026-05-12T09:00:26.000Z", "sessionId": "mock", "cwd": "/repo", "message": {"role": "assistant", "content": [{"type": "text", "text": "Understood, pnpm from here on."}]}}
+{"type": "user", "uuid": "u0003", "timestamp": "2026-05-12T09:00:46.000Z", "sessionId": "mock", "cwd": "/repo", "message": {"role": "user", "content": "Add the date-fns dependency."}}
+{"type": "assistant", "uuid": "u0004", "timestamp": "2026-05-12T09:00:55.000Z", "sessionId": "mock", "cwd": "/repo", "message": {"role": "assistant", "content": [{"type": "text", "text": "Which package manager does this project use?"}]}}

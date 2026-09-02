@@ -174,21 +174,36 @@ TARGET_FIELDS = ("file_path", "path", "notebook_path", "command", "url",
 RE_WS = re.compile(r"\s+")
 
 
+# A heredoc body is the payload, not the action: two `cat <<MSG` writing
+# different text are the same action attempted twice, so the body is dropped
+# before the signature is taken. Nothing else is dropped.
+RE_HEREDOC = re.compile(r"<<-?\s*'?\"?(\w+)'?\"?.*?^\1", re.S | re.M)
+
+
 def signature(tool, tool_input):
     """A stable, comparable identity for "the same action, tried again".
 
-    C2 (repeated failing action) is a string equality once this exists, and a
-    judgement call if it does not. Bash collapses to its first few words so
-    that the same command with a different heredoc still matches; file tools
-    collapse to their path. Deliberately lossy — it is an index, not a record,
-    and `input` is kept in full beside it."""
+    C2 is a string equality once this exists, and a judgement call if it does
+    not. So the label has to distinguish two different actions — which the
+    first version did not.
+
+    It cut the command at the first ` && `, on the theory that the leading
+    words identify the attempt. Almost every real command is `cd <somewhere>
+    && <the actual work>`, so it kept the `cd` and discarded the work.
+    Measured: 950 of 5,537 Bash actions — 17.2% — collapsed to a bare
+    `cd <path>`, with one label covering 82 unrelated commands. It made C2
+    blind to real repeats and liable to fire on unrelated ones, and it made
+    the evidence unreadable: a verdict concluded "no commits are present" when
+    all seven entries were `git add ... && git commit ...`.
+
+    Now the whole command is kept, minus heredoc bodies, capped for
+    comparability."""
     inp = tool_input or {}
     if tool == "Bash":
-        cmd = RE_WS.sub(" ", str(inp.get("command") or "")).strip()
-        # First line only, and only the leading words: a long command that
-        # differs in a later argument is still the same attempt.
-        head = cmd.split(" && ")[0].split(" | ")[0]
-        return "bash:" + " ".join(head.split()[:6])
+        cmd = str(inp.get("command") or "")
+        cmd = RE_HEREDOC.sub("<<...", cmd)
+        cmd = RE_WS.sub(" ", cmd).strip()
+        return "bash:" + cmd[:160]
     for f in TARGET_FIELDS:
         if inp.get(f):
             v = RE_WS.sub(" ", str(inp[f])).strip()
@@ -460,6 +475,13 @@ def actions(evs):
         r = res.get(e.get("tool_use_id"))
         out.append({"seq": e["seq"], "turn": e["turn"], "at": e["at"],
                     "epoch": e["epoch"], "uuid": e["uuid"],
+                    # Carried so a result can be paired to its command exactly.
+                    # Dropping it forced consumers to guess by walking back for
+                    # the nearest call of the same tool, which mislabelled 430
+                    # of 7,693 results — 5.6% — whenever similar calls ran
+                    # together. The pairing was always available; it was thrown
+                    # away one layer too early.
+                    "tool_use_id": e.get("tool_use_id"),
                     "tool": e["tool"], "sig": e["sig"], "target": e["target"],
                     "outcome": ("ok" if r and r["ok"] else
                                 "error" if r else "no-result"),

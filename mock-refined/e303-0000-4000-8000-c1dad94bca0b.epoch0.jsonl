@@ -1,0 +1,6 @@
+{"type": "user", "uuid": "u0001", "timestamp": "2026-05-12T09:00:10.000Z", "sessionId": "mock", "cwd": "/repo", "message": {"role": "user", "content": "Add a health endpoint to the api."}}
+{"type": "user", "uuid": "u0002", "timestamp": "2026-05-12T09:00:18.000Z", "sessionId": "mock", "cwd": "/repo", "message": {"role": "user", "content": "sorry — to the worker, not the api."}}
+{"type": "assistant", "uuid": "u0003", "timestamp": "2026-05-12T09:00:21.000Z", "sessionId": "mock", "cwd": "/repo", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "tu0003", "name": "Edit", "input": {"file_path": "worker/server.py"}}]}}
+{"type": "user", "uuid": "u0004", "timestamp": "2026-05-12T09:00:23.000Z", "sessionId": "mock", "cwd": "/repo", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu0003", "is_error": false, "content": "The file worker/server.py has been updated."}]}}
+{"type": "assistant", "uuid": "u0005", "timestamp": "2026-05-12T09:00:29.000Z", "sessionId": "mock", "cwd": "/repo", "message": {"role": "assistant", "content": [{"type": "text", "text": "The worker serves /health on 8081 and reports queue depth."}]}}
+{"type": "user", "uuid": "u0006", "timestamp": "2026-05-12T09:00:49.000Z", "sessionId": "mock", "cwd": "/repo", "message": {"role": "user", "content": "great"}}
