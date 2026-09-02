@@ -21,3 +21,9 @@ refined/
 # this entry is a net in case one is ever created here by mistake.
 .env
 .DS_Store
+
+# Per-machine Claude Code permissions. Accumulates absolute paths from whatever
+# session granted a rule (scratchpad dirs, one-off script paths), so it is
+# noise in a shared history. settings.json beside it IS tracked — it registers
+# the hooks and belongs to the project.
+.claude/settings.local.json
